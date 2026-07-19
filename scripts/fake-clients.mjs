@@ -105,6 +105,8 @@ function parseArgs(argv) {
   opts.concurrency = clampInt(opts.concurrency, 1, 500, "concurrency");
   opts.errorRate = clampFloat(opts.errorRate, 0, 1, "error-rate");
   opts.seed = Number(opts.seed) || Date.now();
+  if (opts.ingestKey == null) fail("ingest-key requires a value");
+  opts.ingestKey = String(opts.ingestKey);
   try {
     const endpoint = new URL(opts.endpoint);
     if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") throw new Error("unsupported protocol");
@@ -134,8 +136,8 @@ Options:
 }
 
 function clampInt(value, min, max, label) {
-  const n = Number.parseInt(String(value), 10);
-  if (!Number.isFinite(n) || n < min || n > max) {
+  const n = Number(String(value).trim());
+  if (!Number.isSafeInteger(n) || n < min || n > max) {
     fail(`${label} must be between ${min} and ${max}`);
   }
   return n;

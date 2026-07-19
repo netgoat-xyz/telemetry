@@ -4,6 +4,7 @@ const defaults = {
   events: 120,
   interval: 35,
   seed: Date.now(),
+  ingestKey: process.env.ERROR_MONITOR_INGEST_KEY || "",
 };
 
 const services = ["dashboard-web", "billing-api", "edge-proxy", "worker-sync", "auth-gateway", "checkout"];
@@ -96,19 +97,36 @@ Options:
   --events <n>      Default: ${defaults.events}
   --interval <ms>   Default: ${defaults.interval}
   --seed <n>        Default: current timestamp
+  --ingest-key <v>  Shared key. Defaults to ERROR_MONITOR_INGEST_KEY.
 `);
       process.exit(0);
     }
-    if (!arg.startsWith("--")) continue;
+    if (!arg.startsWith("--")) throw new Error(`Unexpected argument: ${arg}`);
     const [key, inline] = arg.slice(2).split("=", 2);
     const value = inline ?? argv[++i];
     if (key === "endpoint") opts.endpoint = value;
-    else if (key === "events") opts.events = Number.parseInt(value, 10);
-    else if (key === "interval") opts.interval = Number.parseInt(value, 10);
+    else if (key === "events") opts.events = value;
+    else if (key === "interval") opts.interval = value;
     else if (key === "seed") opts.seed = Number(value);
+    else if (key === "ingest-key") opts.ingestKey = value;
     else throw new Error(`Unknown option: --${key}`);
   }
+  opts.events = boundedInteger(opts.events, 1, 100000, "events");
+  opts.interval = boundedInteger(opts.interval, 0, 60000, "interval");
+  if (!Number.isFinite(opts.seed)) throw new Error("seed must be a finite number");
+  if (opts.ingestKey == null) throw new Error("ingest-key requires a value");
+  opts.ingestKey = String(opts.ingestKey);
+  const endpoint = new URL(opts.endpoint);
+  if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") throw new Error("endpoint must use HTTP or HTTPS");
   return opts;
+}
+
+function boundedInteger(value, min, max, label) {
+  const number = Number(String(value).trim());
+  if (!Number.isSafeInteger(number) || number < min || number > max) {
+    throw new Error(`${label} must be between ${min} and ${max}`);
+  }
+  return number;
 }
 
 function rng(seed) {
@@ -167,11 +185,14 @@ function eventFor(r, index) {
   };
 }
 
-async function post(endpoint, event) {
+async function post(endpoint, event, ingestKey) {
+  const headers = { "Content-Type": "application/json" };
+  if (ingestKey) headers["X-Error-Monitor-Key"] = ingestKey;
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(event),
+    signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
 }
@@ -182,7 +203,7 @@ async function main() {
   console.log(`fake-errors endpoint=${opts.endpoint} events=${opts.events} interval=${opts.interval}ms`);
   for (let i = 1; i <= opts.events; i++) {
     const event = eventFor(r, i);
-    await post(opts.endpoint, event);
+    await post(opts.endpoint, event, opts.ingestKey);
     if (i % 10 === 0 || i === opts.events) {
       console.log(`posted ${i}/${opts.events}`);
     }
