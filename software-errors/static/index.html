@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Software Error Monitor</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+        mono: ['JetBrains Mono', 'monospace'],
+      },
+    },
+  },
+};
+</script>
+<style>
+html { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+::selection { background: #e4e4e7; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 3px; }
+.line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+</style>
+</head>
+<body class="bg-zinc-50 text-zinc-900 font-sans antialiased">
+<div id="app"></div>
+<script>
+const icons = {
+  alert: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v5"/><path d="M12 17h.01"/></svg>',
+  check: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>',
+  search: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
+  refresh: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
+};
+
+const state = {
+  stats: null,
+  issues: [],
+  selected: null,
+  detail: null,
+  filters: {
+    status: localStorage.getItem('errors_status') || 'open',
+    level: 'all',
+    environment: 'all',
+    service: 'all',
+    q: '',
+  },
+};
+
+const $ = (sel, ctx = document) => ctx.querySelector(sel);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (n) => Number(n || 0).toLocaleString();
+
+function timeAgo(value) {
+  if (!value) return '-';
+  const diff = Date.now() - new Date(value).getTime();
+  const min = Math.floor(diff / 60000);
+  const hr = Math.floor(diff / 3600000);
+  const day = Math.floor(diff / 86400000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  if (hr < 24) return `${hr}h ago`;
+  return `${day}d ago`;
+}
+
+function levelClass(level) {
+  if (level === 'fatal') return 'bg-red-100 text-red-800 border-red-200';
+  if (level === 'error') return 'bg-red-50 text-red-700 border-red-200';
+  if (level === 'warning') return 'bg-amber-50 text-amber-700 border-amber-200';
+  return 'bg-zinc-100 text-zinc-700 border-zinc-200';
+}
+
+function statusClass(status) {
+  return status === 'resolved'
+    ? 'bg-green-50 text-green-700 border-green-200'
+    : 'bg-zinc-100 text-zinc-700 border-zinc-200';
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(body.error || 'Request failed');
+  }
+  return res.json();
+}
+
+function qs() {
+  const p = new URLSearchParams();
+  Object.entries(state.filters).forEach(([key, value]) => {
+    if (value && value !== 'all') p.set(key, value);
+  });
+  return p.toString();
+}
+
+async function load() {
+  const [stats, issues] = await Promise.all([
+    api('/api/stats'),
+    api('/api/issues?' + qs()),
+  ]);
+  state.stats = stats;
+  state.issues = issues;
+  if (!state.selected && issues[0]) state.selected = issues[0].id;
+  if (state.selected) await loadDetail(state.selected, false);
+  render();
+}
+
+async function loadDetail(id, rerender = true) {
+  state.selected = id;
+  state.detail = await api('/api/issues/' + encodeURIComponent(id));
+  if (rerender) render();
+}
+
+async function setStatus(id, status) {
+  await api('/api/issues/' + encodeURIComponent(id), {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  });
+  await load();
+}
+
+function renderStat(label, value, tone = 'zinc') {
+  const tones = {
+    zinc: 'border-zinc-200 bg-white text-zinc-900',
+    red: 'border-red-200 bg-red-50 text-red-800',
+    amber: 'border-amber-200 bg-amber-50 text-amber-800',
+    green: 'border-green-200 bg-green-50 text-green-800',
+  };
+  return `
+    <div class="rounded-lg border ${tones[tone]} px-4 py-3">
+      <div class="text-xs font-medium uppercase tracking-wider opacity-70">${label}</div>
+      <div class="mt-1 text-2xl font-semibold tracking-tight tabular-nums">${value}</div>
+    </div>
+  `;
+}
+
+function renderFilters() {
+  const s = state.stats || { services: [], environments: [] };
+  return `
+    <div class="bg-white border-b border-zinc-200 px-4 sm:px-6 py-3">
+      <div class="flex flex-col lg:flex-row gap-3 lg:items-center">
+        <div class="relative flex-1">
+          <span class="absolute inset-y-0 left-3 flex items-center text-zinc-400">${icons.search}</span>
+          <input id="query" value="${esc(state.filters.q)}" placeholder="Search issues, services, releases..." class="w-full h-10 rounded-md border border-zinc-200 bg-white pl-9 pr-3 text-sm outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10">
+        </div>
+        ${select('status', ['open', 'resolved', 'all'])}
+        ${select('level', ['all', 'fatal', 'error', 'warning', 'info'])}
+        ${select('environment', ['all', ...(s.environments || [])])}
+        ${select('service', ['all', ...(s.services || [])])}
+        <button id="refresh" class="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 hover:bg-zinc-50">${icons.refresh} Refresh</button>
+      </div>
+    </div>
+  `;
+}
+
+function select(name, values) {
+  return `
+    <select id="${name}" class="h-10 rounded-md border border-zinc-200 bg-white px-3 text-sm text-zinc-700 outline-none focus:border-zinc-900 focus:ring-2 focus:ring-zinc-900/10">
+      ${values.map((value) => `<option value="${esc(value)}" ${state.filters[name] === value ? 'selected' : ''}>${esc(value)}</option>`).join('')}
+    </select>
+  `;
+}
+
+function renderIssueRow(issue) {
+  const active = state.selected === issue.id;
+  return `
+    <button class="issue-row block w-full border-b border-zinc-100 px-4 py-4 text-left transition-colors hover:bg-zinc-50 ${active ? 'bg-zinc-50' : 'bg-white'}" data-id="${esc(issue.id)}">
+      <div class="flex items-start justify-between gap-3">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <span class="rounded-md border px-2 py-0.5 text-xs font-medium ${levelClass(issue.level)}">${esc(issue.level)}</span>
+            <span class="rounded-md border px-2 py-0.5 text-xs font-medium ${statusClass(issue.status)}">${esc(issue.status)}</span>
+          </div>
+          <div class="mt-2 line-clamp-2 text-sm font-semibold text-zinc-900">${esc(issue.title)}</div>
+          <div class="mt-1 truncate text-xs text-zinc-500">${esc(issue.culprit)}</div>
+        </div>
+        <div class="shrink-0 text-right">
+          <div class="font-mono text-sm font-semibold tabular-nums text-zinc-900">${fmt(issue.count)}</div>
+          <div class="text-xs text-zinc-400">${timeAgo(issue.last_seen)}</div>
+        </div>
+      </div>
+      <div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+        <span class="font-mono">${esc(issue.service)}</span>
+        <span>${esc(issue.environment)}</span>
+        <span>${esc(issue.release)}</span>
+        <span>${fmt(issue.user_count)} users</span>
+      </div>
+    </button>
+  `;
+}
+
+function renderDetail() {
+  const data = state.detail;
+  if (!data?.issue) {
+    return `<div class="flex h-full items-center justify-center text-sm text-zinc-500">Select an issue</div>`;
+  }
+  const { issue, events } = data;
+  const latest = events[0] || {};
+  return `
+    <div class="h-full overflow-y-auto">
+      <div class="border-b border-zinc-200 bg-white px-6 py-5">
+        <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+          <div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="rounded-md border px-2 py-0.5 text-xs font-medium ${levelClass(issue.level)}">${esc(issue.level)}</span>
+              <span class="rounded-md border px-2 py-0.5 text-xs font-medium ${statusClass(issue.status)}">${esc(issue.status)}</span>
+              <span class="font-mono text-xs text-zinc-400">${esc(issue.id)}</span>
+            </div>
+            <h1 class="mt-3 max-w-4xl text-xl font-semibold tracking-tight text-zinc-900">${esc(issue.title)}</h1>
+            <p class="mt-1 text-sm text-zinc-500">${esc(issue.culprit)}</p>
+          </div>
+          <button id="toggle-status" class="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-zinc-200 bg-white px-4 text-sm font-medium text-zinc-900 hover:bg-zinc-50">
+            ${issue.status === 'resolved' ? icons.alert + ' Reopen' : icons.check + ' Resolve'}
+          </button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 gap-6 p-6 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <section class="space-y-6">
+          ${panel('Stack trace', latest.stack ? `<pre class="overflow-x-auto whitespace-pre-wrap rounded-lg bg-zinc-950 p-4 font-mono text-xs leading-relaxed text-zinc-100">${esc(latest.stack)}</pre>` : empty('No stack trace captured'))}
+          ${panel('Breadcrumbs', renderBreadcrumbs(latest.breadcrumbs))}
+          ${panel('Recent events', renderEvents(events))}
+        </section>
+
+        <aside class="space-y-6">
+          ${panel('Impact', `
+            <dl class="grid grid-cols-2 gap-3 text-sm">
+              ${kv('Events', fmt(issue.count))}
+              ${kv('Users', fmt(issue.user_count))}
+              ${kv('First seen', new Date(issue.first_seen).toLocaleString())}
+              ${kv('Last seen', new Date(issue.last_seen).toLocaleString())}
+            </dl>
+          `)}
+          ${panel('Context', `
+            <dl class="space-y-3 text-sm">
+              ${kv('Service', issue.service)}
+              ${kv('Environment', issue.environment)}
+              ${kv('Release', issue.release)}
+              ${kv('URL', latest.url || '-')}
+              ${kv('Transaction', latest.transaction || '-')}
+            </dl>
+          `)}
+          ${panel('Tags', renderTags(latest.tags))}
+          ${panel('User', renderUser(latest.user))}
+        </aside>
+      </div>
+    </div>
+  `;
+}
+
+function panel(title, body) {
+  return `
+    <div class="rounded-xl border border-zinc-200 bg-white shadow-sm">
+      <div class="border-b border-zinc-100 px-5 py-3">
+        <h2 class="text-sm font-semibold text-zinc-900">${title}</h2>
+      </div>
+      <div class="p-5">${body}</div>
+    </div>
+  `;
+}
+
+function kv(label, value) {
+  return `
+    <div>
+      <dt class="text-xs font-medium uppercase tracking-wider text-zinc-400">${esc(label)}</dt>
+      <dd class="mt-1 break-words text-zinc-700">${esc(value)}</dd>
+    </div>
+  `;
+}
+
+function empty(text) {
+  return `<div class="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-6 text-center text-sm text-zinc-500">${esc(text)}</div>`;
+}
+
+function renderTags(tags) {
+  const entries = Object.entries(tags || {});
+  if (!entries.length) return empty('No tags captured');
+  return `<div class="flex flex-wrap gap-2">${entries.map(([k, v]) => `<span class="rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs text-zinc-600">${esc(k)}=${esc(v)}</span>`).join('')}</div>`;
+}
+
+function renderUser(user) {
+  if (!user) return empty('No user captured');
+  return `<dl class="space-y-3 text-sm">${kv('ID', user.id)}${kv('Email', user.email || '-')}${kv('IP', user.ip_address || '-')}</dl>`;
+}
+
+function renderBreadcrumbs(rows) {
+  if (!rows?.length) return empty('No breadcrumbs captured');
+  return `
+    <div class="space-y-2">
+      ${rows.map((row) => `
+        <div class="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
+          <div class="flex items-center justify-between gap-3">
+            <span class="font-mono text-xs text-zinc-500">${esc(row.category || row.type || 'log')}</span>
+            <span class="text-xs text-zinc-400">${row.timestamp ? timeAgo(row.timestamp) : ''}</span>
+          </div>
+          <div class="mt-1 text-sm text-zinc-700">${esc(row.message || row.data?.url || JSON.stringify(row.data || {}))}</div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderEvents(events) {
+  if (!events?.length) return empty('No events captured');
+  return `
+    <div class="overflow-hidden rounded-lg border border-zinc-200">
+      <table class="w-full">
+        <thead class="bg-zinc-50">
+          <tr class="border-b border-zinc-200">
+            <th class="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">Time</th>
+            <th class="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">Release</th>
+            <th class="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">User</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${events.map((event, i) => `
+            <tr class="${i === events.length - 1 ? '' : 'border-b border-zinc-100'}">
+              <td class="px-4 py-3 text-sm text-zinc-500">${new Date(event.timestamp).toLocaleString()}</td>
+              <td class="px-4 py-3 font-mono text-xs text-zinc-600">${esc(event.release)}</td>
+              <td class="px-4 py-3 text-sm text-zinc-600">${esc(event.user?.email || event.user?.id || '-')}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function render() {
+  const s = state.stats || {};
+  $('#app').innerHTML = `
+    <div class="flex h-screen flex-col overflow-hidden">
+      <header class="border-b border-zinc-200 bg-white px-4 sm:px-6 py-4">
+        <div class="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div>
+            <div class="text-xs font-medium uppercase tracking-wider text-zinc-500">NetGoat software errors</div>
+            <h1 class="mt-1 text-2xl font-semibold tracking-tight text-zinc-900">Issues</h1>
+          </div>
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            ${renderStat('Open', fmt(s.open_issues), s.open_issues ? 'red' : 'green')}
+            ${renderStat('Events', fmt(s.total_events), 'zinc')}
+            ${renderStat('Users', fmt(s.affected_users), 'zinc')}
+            ${renderStat('24h', fmt(s.events_24h), s.events_24h ? 'amber' : 'zinc')}
+          </div>
+        </div>
+      </header>
+      ${renderFilters()}
+      <main class="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[420px_minmax(0,1fr)]">
+        <section class="min-h-0 overflow-y-auto border-r border-zinc-200 bg-white">
+          ${state.issues.length ? state.issues.map(renderIssueRow).join('') : `<div class="p-10 text-center text-sm text-zinc-500">No matching issues</div>`}
+        </section>
+        <section class="min-h-0 bg-zinc-50">${renderDetail()}</section>
+      </main>
+    </div>
+  `;
+
+  $('.issue-row', document)?.focus?.();
+  document.querySelectorAll('.issue-row').forEach((row) => {
+    row.addEventListener('click', () => loadDetail(row.dataset.id));
+  });
+  ['status', 'level', 'environment', 'service'].forEach((name) => {
+    $('#' + name).addEventListener('change', (e) => {
+      state.filters[name] = e.target.value;
+      if (name === 'status') localStorage.setItem('errors_status', e.target.value);
+      state.selected = null;
+      load();
+    });
+  });
+  $('#query').addEventListener('input', debounce((e) => {
+    state.filters.q = e.target.value;
+    state.selected = null;
+    load();
+  }, 250));
+  $('#refresh').addEventListener('click', load);
+  $('#toggle-status')?.addEventListener('click', () => setStatus(state.detail.issue.id, state.detail.issue.status === 'resolved' ? 'open' : 'resolved'));
+}
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+load().catch((err) => {
+  $('#app').innerHTML = `<div class="flex min-h-screen items-center justify-center p-6"><div class="rounded-xl border border-red-200 bg-red-50 p-6 text-sm text-red-700">${esc(err.message)}</div></div>`;
+});
+setInterval(() => load().catch(() => {}), 5000);
+</script>
+</body>
+</html>

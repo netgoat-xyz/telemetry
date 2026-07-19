@@ -1,0 +1,17 @@
+# Go build and test artifacts
+/telemetry-server
+*.test
+*.out
+coverage.*
+
+# JavaScript dependencies and runtime state
+node_modules/
+*.log
+
+# Local configuration and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/

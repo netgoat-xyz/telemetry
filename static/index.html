@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Telemetry Server</title>
+<meta name="description" content="Telemetry server dashboard and management interface">
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+      },
+      animation: {
+        'fade-in': 'fadeIn 0.2s ease-out',
+        'slide-up': 'slideUp 0.3s ease-out',
+        'scale-in': 'scaleIn 0.2s ease-out',
+      },
+      keyframes: {
+        fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
+        slideUp: { '0%': { opacity: '0', transform: 'translateY(8px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } },
+        scaleIn: { '0%': { opacity: '0', transform: 'scale(0.95)' }, '100%': { opacity: '1', transform: 'scale(1)' } },
+      },
+    },
+  },
+};
+</script>
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+::selection { background-color: #e4e4e7; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #a1a1aa; }
+@keyframes pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.skeleton { background: #f4f4f5; border-radius: 6px; animation: pulse-soft 2s ease-in-out infinite; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.status-dot.online { background: #059669; box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.2); }
+.status-dot.offline { background: #a1a1aa; }
+.status-dot.startup { background: #2563eb; box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2); }
+.status-dot.shutdown { background: #dc2626; box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2); }
+.status-dot.heartbeat { background: #059669; box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.2); }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+</style>
+</head>
+<body class="antialiased bg-zinc-50 text-zinc-900 font-sans">
+<div id="app"></div>
+<script>
+// ============================================================
+// STATE
+// ============================================================
+const state = {
+  token: localStorage.getItem('telemetry_token'),
+  user: localStorage.getItem('telemetry_user'),
+  sidebarOpen: false,
+  theme: localStorage.getItem('telemetry_theme') || 'light',
+  loading: false,
+};
+
+// ============================================================
+// SVG ICONS
+// ============================================================
+const icons = {
+  server: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+  dashboard: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
+  monitor: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
+  activity: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+  user: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+  login: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>',
+  logout: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
+  search: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+  chevronRight: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>',
+  chevronLeft: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>',
+  clock: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  check: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+  alertCircle: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+  x: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  copy: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  menu: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>',
+  refresh: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
+  key: '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
+  eye: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+  hash: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>',
+  serverSmall: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+  empty: '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>',
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+function $(sel, ctx) { return (ctx || document).querySelector(sel); }
+function $$(sel, ctx) { return Array.from((ctx || document).querySelectorAll(sel)); }
+
+function formatTime(iso) {
+  const d = new Date(iso);
+  const now = new Date();
+  const diff = now - d;
+  const mins = Math.floor(diff / 60000);
+  const hrs = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
+
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  if (hrs < 24) return hrs + 'h ago';
+  if (days < 7) return days + 'd ago';
+  return d.toLocaleDateString();
+}
+
+function formatTimeFull(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+
+function formatDuration(s) {
+  if (!s) return '-';
+  if (s.startsWith('0s') || s === '<1s') return '<1s';
+  return s;
+}
+
+function truncate(str, n) {
+  if (!str) return '-';
+  return str.length > n ? str.slice(0, n) + '\u2026' : str;
+}
+
+function copyToClipboard(text) {
+  navigator.clipboard.writeText(text).catch(() => {});
+}
+
+function pluralize(n, s) {
+  return n + ' ' + s + (n !== 1 ? 's' : '');
+}
+
+function formatNumber(n) {
+  const value = Number(n || 0);
+  return Number.isFinite(value) ? value.toLocaleString() : '0';
+}
+
+function formatLatency(ms) {
+  const value = Number(ms || 0);
+  if (!Number.isFinite(value) || value <= 0) return '-';
+  return value < 10 ? value.toFixed(1) + ' ms' : Math.round(value).toLocaleString() + ' ms';
+}
+
+function percent(part, total) {
+  const p = Number(part || 0);
+  const t = Number(total || 0);
+  if (!t) return '0%';
+  return ((p / t) * 100).toFixed(p > 0 && p < t ? 1 : 0) + '%';
+}
+
+function mergeCountMaps(target, source) {
+  if (!source) return target;
+  Object.entries(source).forEach(([key, value]) => {
+    target[key] = (target[key] || 0) + Number(value || 0);
+  });
+  return target;
+}
+
+function aggregateAppStats(items) {
+  const aggregate = {
+    routes: 0,
+    users: 0,
+    requests: 0,
+    blocked: 0,
+    proxy_errors: 0,
+    total_errors: 0,
+    avg_latency_ms: 0,
+    status_codes: {},
+    block_reasons: {},
+    error_status_codes: {},
+    recent_errors: [],
+  };
+  let latencyCount = 0;
+  (items || []).forEach(item => {
+    const app = item?.app;
+    if (!app) return;
+    aggregate.routes += Number(app.routes || 0);
+    aggregate.users += Number(app.users || 0);
+    aggregate.requests += Number(app.requests || 0);
+    aggregate.blocked += Number(app.blocked || 0);
+    aggregate.proxy_errors += Number(app.proxy_errors || 0);
+    aggregate.total_errors += Number(app.total_errors || 0);
+    if (Number(app.avg_latency_ms) > 0) {
+      aggregate.avg_latency_ms += Number(app.avg_latency_ms);
+      latencyCount++;
+    }
+    mergeCountMaps(aggregate.status_codes, app.status_codes);
+    mergeCountMaps(aggregate.block_reasons, app.block_reasons);
+    mergeCountMaps(aggregate.error_status_codes, app.error_status_codes);
+    if (Array.isArray(app.recent_errors)) {
+      aggregate.recent_errors.push(...app.recent_errors.map(err => ({ ...err, host: item.hostname, agent: item.instance_id })));
+    }
+  });
+  aggregate.avg_latency_ms = latencyCount ? aggregate.avg_latency_ms / latencyCount : 0;
+  aggregate.recent_errors.sort((a, b) => new Date(b.last_seen || 0) - new Date(a.last_seen || 0));
+  aggregate.recent_errors = aggregate.recent_errors.slice(0, 8);
+  return aggregate;
+}
+
+function latestPerAgent(events) {
+  const byAgent = new Map();
+  (events || []).forEach(event => {
+    const id = event.instance_id || '';
+    if (!id) return;
+    const existing = byAgent.get(id);
+    if (!existing || new Date(event.timestamp || 0) > new Date(existing.timestamp || 0)) {
+      byAgent.set(id, event);
+    }
+  });
+  return Array.from(byAgent.values());
+}
+
+function hasAppStats(app) {
+  return !!app && (app.requests || app.blocked || app.proxy_errors || app.total_errors || (app.recent_errors && app.recent_errors.length));
+}
+
+function topEntries(map, max = 5) {
+  return Object.entries(map || {})
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+    .slice(0, max);
+}
+
+function statusColor(status) {
+  if (status === 'online') return 'text-green-700 bg-green-50 border-green-200';
+  if (status === 'offline') return 'text-zinc-500 bg-zinc-100 border-zinc-200';
+  return 'text-zinc-500 bg-zinc-100 border-zinc-200';
+}
+
+function eventColor(type) {
+  if (type === 'startup') return 'bg-blue-50 text-blue-700 border-blue-200';
+  if (type === 'shutdown') return 'bg-red-50 text-red-700 border-red-200';
+  if (type === 'heartbeat') return 'bg-green-50 text-green-700 border-green-200';
+  return 'bg-zinc-100 text-zinc-700 border-zinc-200';
+}
+
+// ============================================================
+// API CLIENT
+// ============================================================
+async function api(path, options = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  if (state.token) {
+    headers['Authorization'] = 'Bearer ' + state.token;
+  }
+  try {
+    const res = await fetch(path, { ...options, headers });
+    if (res.status === 401) {
+      state.token = null;
+      state.user = null;
+      localStorage.removeItem('telemetry_token');
+      localStorage.removeItem('telemetry_user');
+      navigate('/login');
+      return null;
+    }
+    if (res.status === 204) return {};
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(body.error || 'Request failed');
+    }
+    return res.json();
+  } catch (err) {
+    if (err.message === 'Failed to fetch') {
+      throw new Error('Cannot reach server');
+    }
+    throw err;
+  }
+}
+
+// ============================================================
+// ROUTER
+// ============================================================
+function navigate(path) {
+  history.pushState(null, '', path);
+  render();
+}
+
+window.addEventListener('popstate', render);
+
+let refreshInterval = null;
+
+function render() {
+  clearInterval(refreshInterval);
+  refreshInterval = null;
+
+  const path = window.location.pathname;
+
+  if (path === '/login') {
+    if (state.token) { navigate('/'); return; }
+    renderLogin();
+    return;
+  }
+
+  if (!state.token) { navigate('/login'); return; }
+
+  renderLayout('');
+
+  if (path === '/') {
+    renderDashboard();
+  } else if (path === '/agents') {
+    renderAgents();
+  } else if (/^\/agents\//.test(path)) {
+    renderAgentDetail(path.replace('/agents/', ''));
+  } else if (path === '/events') {
+    renderEvents();
+  } else {
+    renderNotFound();
+  }
+}
+
+// ============================================================
+// LAYOUT COMPONENT
+// ============================================================
+function renderLayout(content) {
+  const app = $('#app');
+  const theme = state.theme;
+  if (theme === 'dark') { document.documentElement.classList.add('dark'); }
+  else { document.documentElement.classList.remove('dark'); }
+
+  app.innerHTML = `
+    <div class="flex h-screen overflow-hidden bg-zinc-50">
+      <aside class="fixed inset-y-0 left-0 z-30 w-60 bg-white border-r border-zinc-200 flex flex-col transform transition-transform duration-200 ease-out md:translate-x-0 ${state.sidebarOpen ? 'translate-x-0' : '-translate-x-full'}" role="navigation" aria-label="Main navigation">
+        <div class="flex items-center gap-3 h-14 px-5 border-b border-zinc-200 flex-shrink-0">
+          <span class="flex items-center justify-center w-8 h-8 rounded-lg bg-zinc-900 text-white">${icons.server}</span>
+          <span class="text-sm font-semibold text-zinc-900 tracking-tight">Telemetry</span>
+        </div>
+        <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+          <a href="/" class="nav-item flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors duration-150 ${window.location.pathname === '/' ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50'}" data-nav="/">${icons.dashboard} Dashboard</a>
+          <a href="/agents" class="nav-item flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors duration-150 ${window.location.pathname === '/agents' || /^\/agents\//.test(window.location.pathname) ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50'}" data-nav="/agents">${icons.monitor} Agents</a>
+          <a href="/events" class="nav-item flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors duration-150 ${window.location.pathname === '/events' ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50'}" data-nav="/events">${icons.activity} Events</a>
+        </nav>
+        <div class="border-t border-zinc-200 px-3 py-3 space-y-1">
+          <div class="flex items-center gap-3 px-3 py-2 text-sm text-zinc-500">
+            <span class="flex items-center justify-center w-7 h-7 rounded-full bg-zinc-100 text-zinc-500">${icons.user}</span>
+            <span class="truncate">${state.user || 'admin'}</span>
+          </div>
+          <button onclick="handleLogout()" class="flex items-center gap-3 w-full px-3 py-2 rounded-md text-sm font-medium text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50 transition-colors duration-150" aria-label="Sign out">${icons.logout} Sign out</button>
+        </div>
+      </aside>
+
+      <div class="flex-1 flex flex-col min-w-0 md:pl-60">
+        <header class="flex items-center h-14 px-4 sm:px-6 border-b border-zinc-200 bg-white flex-shrink-0 gap-3">
+          <button onclick="toggleSidebar()" class="md:hidden p-2 -ml-2 rounded-md text-zinc-500 hover:text-zinc-900 hover:bg-zinc-100 transition-colors duration-150" aria-label="Toggle sidebar">${icons.menu}</button>
+          <h1 class="text-base font-semibold text-zinc-900 tracking-tight truncate" id="page-title">Dashboard</h1>
+          <div class="flex-1"></div>
+          <button onclick="handleRefresh()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-zinc-500 hover:text-zinc-900 hover:bg-zinc-100 transition-colors duration-150" aria-label="Refresh data" id="refresh-btn">${icons.refresh} <span>Refresh</span></button>
+        </header>
+
+        <main class="flex-1 overflow-y-auto" id="main-content">${content}</main>
+      </div>
+
+      ${state.sidebarOpen ? '<div onclick="toggleSidebar()" class="fixed inset-0 z-20 bg-black/30 md:hidden" aria-hidden="true"></div>' : ''}
+    </div>
+  `;
+
+  $$('.nav-item').forEach(el => {
+    el.addEventListener('click', e => {
+      e.preventDefault();
+      if (window.innerWidth < 768) state.sidebarOpen = false;
+      navigate(el.getAttribute('href'));
+    });
+  });
+
+  $('main')?.focus();
+}
+
+function toggleSidebar() {
+  state.sidebarOpen = !state.sidebarOpen;
+  render();
+}
+
+function handleLogout() {
+  state.token = null;
+  state.user = null;
+  localStorage.removeItem('telemetry_token');
+  localStorage.removeItem('telemetry_user');
+  navigate('/login');
+}
+
+function handleRefresh() {
+  const btn = $('#refresh-btn');
+  if (btn) { btn.classList.add('animate-spin'); setTimeout(() => btn.classList.remove('animate-spin'), 600); }
+  render();
+}
+
+// ============================================================
+// SKELETON COMPONENTS
+// ============================================================
+function skeletonTable(rows = 5, cols = 4) {
+  let html = '<div class="overflow-x-auto"><table class="w-full"><thead><tr>';
+  for (let i = 0; i < cols; i++) {
+    html += '<th class="px-6 py-3"><div class="skeleton h-3 w-24"></div></th>';
+  }
+  html += '</tr></thead><tbody>';
+  for (let r = 0; r < rows; r++) {
+    html += '<tr class="border-b border-zinc-100">';
+    for (let c = 0; c < cols; c++) {
+      html += '<td class="px-6 py-4"><div class="skeleton h-4 w-' + (c === 0 ? '32' : c === 1 ? '24' : c === 2 ? '20' : '16') + '"></div></td>';
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function skeletonCards(count = 3) {
+  return '<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-' + count + ' gap-4">' +
+    Array(count).fill('').map(() => '<div class="bg-white border border-zinc-200 rounded-xl p-6"><div class="skeleton h-3 w-20 mb-3"></div><div class="skeleton h-8 w-16"></div></div>').join('') +
+    '</div>';
+}
+
+function emptyState(icon, title, desc, action) {
+  return `
+    <div class="flex flex-col items-center justify-center py-16 px-4">
+      <div class="text-zinc-300 mb-4">${icon}</div>
+      <h3 class="text-sm font-semibold text-zinc-900 mb-1">${title}</h3>
+      <p class="text-sm text-zinc-500 text-center max-w-sm mb-6">${desc}</p>
+      ${action || ''}
+    </div>
+  `;
+}
+
+function errorState(message, onRetry) {
+  return `
+    <div class="flex flex-col items-center justify-center py-16 px-4">
+      <div class="text-red-400 mb-4">${icons.alertCircle}</div>
+      <h3 class="text-sm font-semibold text-zinc-900 mb-1">Something went wrong</h3>
+      <p class="text-sm text-zinc-500 text-center max-w-sm mb-6">${message}</p>
+      <button onclick="(${onRetry.toString()})()" class="bg-white border border-zinc-200 text-zinc-900 rounded-md px-4 py-2 text-sm font-medium hover:bg-zinc-50 active:bg-zinc-100 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-zinc-900/20 focus-visible:ring-offset-2">Try again</button>
+    </div>
+  `;
+}
+
+function statCard(label, value, icon, accent) {
+  return `
+    <div class="bg-white border border-zinc-200 shadow-sm rounded-xl p-5 transition-all duration-150 hover:shadow-md hover:-translate-y-0.5">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs font-medium text-zinc-500 uppercase tracking-wider">${label}</span>
+        <span class="text-zinc-400 ${accent || ''}">${icon}</span>
+      </div>
+      <div class="text-2xl font-semibold text-zinc-900 tracking-tight leading-none">${value}</div>
+    </div>
+  `;
+}
+
+function compactMetric(label, value, tone = 'zinc') {
+  const tones = {
+    zinc: 'text-zinc-900 bg-zinc-50 border-zinc-200',
+    green: 'text-green-700 bg-green-50 border-green-200',
+    amber: 'text-amber-700 bg-amber-50 border-amber-200',
+    red: 'text-red-700 bg-red-50 border-red-200',
+    blue: 'text-blue-700 bg-blue-50 border-blue-200',
+  };
+  return `
+    <div class="rounded-lg border ${tones[tone] || tones.zinc} px-4 py-3">
+      <div class="text-xs font-medium uppercase tracking-wider opacity-70">${label}</div>
+      <div class="mt-1 text-lg font-semibold tracking-tight tabular-nums">${value}</div>
+    </div>
+  `;
+}
+
+function renderTelemetryPanel(app, options = {}) {
+  const title = options.title || 'Telemetry';
+  if (!hasAppStats(app)) {
+    return `
+      <div class="bg-white border border-zinc-200 shadow-sm rounded-xl overflow-hidden">
+        <div class="px-6 py-4 border-b border-zinc-100">
+          <h2 class="text-sm font-semibold text-zinc-900">${title}</h2>
+        </div>
+        ${emptyState(icons.activity, 'No app metrics yet', 'Metrics will appear with the next agent heartbeat.', '')}
+      </div>
+    `;
+  }
+
+  const errorTone = app.total_errors > 0 ? 'red' : 'green';
+  return `
+    <div class="bg-white border border-zinc-200 shadow-sm rounded-xl overflow-hidden">
+      <div class="px-6 py-4 border-b border-zinc-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <h2 class="text-sm font-semibold text-zinc-900">${title}</h2>
+        <span class="inline-flex items-center gap-1.5 self-start sm:self-auto px-2.5 py-1 rounded-md text-xs font-medium border ${app.total_errors > 0 ? 'bg-red-50 text-red-700 border-red-200' : 'bg-green-50 text-green-700 border-green-200'}">
+          ${app.total_errors > 0 ? icons.alertCircle : icons.check}
+          ${app.total_errors > 0 ? formatNumber(app.total_errors) + ' errors' : 'No errors'}
+        </span>
+      </div>
+      <div class="p-6 space-y-5">
+        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          ${compactMetric('Requests', formatNumber(app.requests), 'blue')}
+          ${compactMetric('Blocked', formatNumber(app.blocked) + ' / ' + percent(app.blocked, app.requests), app.blocked ? 'amber' : 'zinc')}
+          ${compactMetric('Proxy errors', formatNumber(app.proxy_errors), app.proxy_errors ? 'red' : 'green')}
+          ${compactMetric('Avg latency', formatLatency(app.avg_latency_ms), errorTone)}
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          ${renderCountList('HTTP errors', app.error_status_codes, code => code)}
+          ${renderCountList('Block reasons', app.block_reasons, reason => reason)}
+        </div>
+        ${renderRecentErrors(app.recent_errors)}
+      </div>
+    </div>
+  `;
+}
+
+function renderCountList(title, map, labelFn) {
+  const rows = topEntries(map);
+  return `
+    <div>
+      <div class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">${title}</div>
+      ${rows.length === 0 ? '<div class="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-500">None</div>' : `
+        <div class="rounded-lg border border-zinc-200 overflow-hidden">
+          ${rows.map(([key, value], i) => `
+            <div class="flex items-center justify-between gap-3 px-4 py-2.5 text-sm ${i === rows.length - 1 ? '' : 'border-b border-zinc-100'}">
+              <span class="text-zinc-700 truncate">${escHtml(labelFn(key))}</span>
+              <span class="font-mono text-xs text-zinc-500 tabular-nums">${formatNumber(value)}</span>
+            </div>
+          `).join('')}
+        </div>
+      `}
+    </div>
+  `;
+}
+
+function renderRecentErrors(errors) {
+  const rows = errors || [];
+  return `
+    <div>
+      <div class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Recent errors</div>
+      ${rows.length === 0 ? '<div class="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-500">None</div>' : `
+        <div class="overflow-x-auto rounded-lg border border-zinc-200">
+          <table class="w-full">
+            <thead>
+              <tr class="bg-zinc-50 border-b border-zinc-200">
+                <th class="px-4 py-2.5 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Type</th>
+                <th class="px-4 py-2.5 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Message</th>
+                <th class="px-4 py-2.5 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Agent</th>
+                <th class="px-4 py-2.5 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Count</th>
+                <th class="px-4 py-2.5 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Last seen</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map((err, i) => `
+                <tr class="border-b border-zinc-100 ${i === rows.length - 1 ? 'border-b-0' : ''}">
+                  <td class="px-4 py-3">
+                    <span class="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium border ${err.kind === 'proxy' ? 'bg-red-50 text-red-700 border-red-200' : 'bg-amber-50 text-amber-700 border-amber-200'}">${escHtml(err.kind || 'error')}</span>
+                  </td>
+                  <td class="px-4 py-3 text-sm text-zinc-700 max-w-md truncate" title="${escHtml(err.message || '')}">${escHtml(err.message || '-')}</td>
+                  <td class="px-4 py-3 text-xs text-zinc-500 font-mono">${truncate(err.host || err.agent || '-', 18)}</td>
+                  <td class="px-4 py-3 text-sm text-zinc-700 font-mono text-right tabular-nums">${formatNumber(err.count)}</td>
+                  <td class="px-4 py-3 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${err.last_seen ? formatTime(err.last_seen) : '-'}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// ============================================================
+// PAGE: LOGIN
+// ============================================================
+function renderLogin() {
+  const app = $('#app');
+  app.innerHTML = `
+    <div class="min-h-screen flex items-center justify-center bg-zinc-50 px-4">
+      <div class="w-full max-w-sm animate-fade-in">
+        <div class="text-center mb-8">
+          <div class="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-zinc-900 text-white mb-4">${icons.server}</div>
+          <h1 class="text-xl font-semibold text-zinc-900 tracking-tight">Telemetry Server</h1>
+          <p class="text-sm text-zinc-500 mt-1">Sign in to manage your agents</p>
+        </div>
+
+        <div class="bg-white border border-zinc-200 shadow-sm rounded-xl p-6">
+          <form onsubmit="handleLogin(event)" novalidate>
+            <div class="space-y-4">
+              <div>
+                <label for="username" class="block text-sm font-medium text-zinc-700 mb-1.5">Username</label>
+                <div class="relative">
+                  <span class="absolute inset-y-0 left-3 flex items-center text-zinc-400">${icons.user}</span>
+                  <input id="username" type="text" autocomplete="username" value="admin" required class="w-full bg-transparent border border-zinc-200 rounded-md pl-9 pr-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900/10 focus:border-zinc-900 transition-all duration-200" placeholder="Enter username">
+                </div>
+              </div>
+              <div>
+                <label for="password" class="block text-sm font-medium text-zinc-700 mb-1.5">Password</label>
+                <div class="relative">
+                  <span class="absolute inset-y-0 left-3 flex items-center text-zinc-400">${icons.key}</span>
+                  <input id="password" type="password" autocomplete="current-password" required class="w-full bg-transparent border border-zinc-200 rounded-md pl-9 pr-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900/10 focus:border-zinc-900 transition-all duration-200" placeholder="Enter password">
+                </div>
+              </div>
+            </div>
+
+            <div id="login-error" class="mt-3 hidden" role="alert">
+              <div class="flex items-center gap-2 text-xs text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">
+                ${icons.alertCircle} <span id="login-error-msg"></span>
+              </div>
+            </div>
+
+            <button type="submit" id="login-btn" class="mt-5 w-full bg-zinc-900 text-white rounded-md px-4 py-2.5 text-sm font-medium hover:bg-zinc-800 active:bg-zinc-950 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-zinc-900/20 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed">
+              Sign in
+            </button>
+          </form>
+        </div>
+
+        <p class="text-center text-xs text-zinc-400 mt-6">Default: <span class="font-mono text-zinc-500">admin</span> / <span class="font-mono text-zinc-500">admin</span></p>
+      </div>
+    </div>
+  `;
+
+  const username = $('#username');
+  if (username) setTimeout(() => username.focus(), 100);
+}
+
+async function handleLogin(e) {
+  e.preventDefault();
+  const btn = $('#login-btn');
+  const errDiv = $('#login-error');
+  const errMsg = $('#login-error-msg');
+  const username = $('#username').value.trim();
+  const password = $('#password').value;
+
+  btn.disabled = true;
+  btn.textContent = 'Signing in\u2026';
+  errDiv.classList.add('hidden');
+
+  try {
+    const data = await api('/api/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    });
+    if (!data) return;
+    state.token = data.token;
+    state.user = data.user;
+    localStorage.setItem('telemetry_token', data.token);
+    localStorage.setItem('telemetry_user', data.user);
+    navigate('/');
+  } catch (err) {
+    errMsg.textContent = err.message || 'Login failed';
+    errDiv.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+}
+
+// ============================================================
+// PAGE: DASHBOARD
+// ============================================================
+let dashboardData = null;
+let dashboardError = null;
+let dashboardLoading = true;
+
+async function renderDashboard() {
+  const title = $('#page-title');
+  if (title) title.textContent = 'Dashboard';
+
+  const main = $('#main-content');
+  if (main) main.innerHTML = skeletonCards(4) + '<div class="mt-6"><div class="bg-white border border-zinc-200 rounded-xl"><div class="px-6 py-4 border-b border-zinc-100"><div class="skeleton h-5 w-32"></div></div>' + skeletonTable(4, 4) + '</div></div>';
+
+  dashboardLoading = true;
+  dashboardError = null;
+  try {
+    const [stats, events, agents] = await Promise.all([
+      api('/api/stats'),
+      api('/api/events'),
+      api('/api/agents'),
+    ]);
+    if (!stats || !events || !agents) return;
+    dashboardData = { stats, events, agents };
+    dashboardLoading = false;
+  } catch (err) {
+    dashboardError = err.message;
+    dashboardLoading = false;
+  }
+  renderDashboardContent();
+}
+
+function renderDashboardContent() {
+  const main = $('#main-content');
+  if (!main) return;
+
+  if (dashboardLoading) {
+    main.innerHTML = skeletonCards(4) + '<div class="mt-6"><div class="bg-white border border-zinc-200 rounded-xl"><div class="px-6 py-4 border-b border-zinc-100"><div class="skeleton h-5 w-32"></div></div>' + skeletonTable(4, 4) + '</div></div>';
+    return;
+  }
+
+  if (dashboardError) {
+    main.innerHTML = errorState(dashboardError, () => { dashboardLoading = true; renderDashboard(); });
+    return;
+  }
+
+  const { stats, events, agents } = dashboardData;
+  const uptime = stats.uptime || '-';
+  const agentCount = stats.agent_count || 0;
+  const totalEvents = stats.total_events || 0;
+  const appStats = aggregateAppStats(agents);
+  const recentEvents = events.slice(0, 10);
+
+  main.innerHTML = `
+    <div class="p-4 sm:p-6 lg:p-8 space-y-6 animate-fade-in">
+      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        ${statCard('Uptime', formatDuration(uptime), icons.clock, '')}
+        ${statCard('Agents', agentCount, icons.serverSmall, '')}
+        ${statCard('Events', totalEvents.toLocaleString(), icons.activity, '')}
+        ${statCard('Errors', formatNumber(appStats.total_errors || stats.total_errors), icons.alertCircle, (appStats.total_errors || stats.total_errors) ? 'text-red-600' : 'text-green-600')}
+      </div>
+
+      ${renderTelemetryPanel(appStats, { title: 'Telemetry Health' })}
+
+      <div class="bg-white border border-zinc-200 shadow-sm rounded-xl overflow-hidden">
+        <div class="px-6 py-4 border-b border-zinc-100 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-zinc-900">Recent Events</h2>
+          ${totalEvents > 0 ? '<a href="/events" onclick="event.preventDefault(); navigate(\'/events\')" class="text-xs font-medium text-blue-600 hover:text-blue-700 transition-colors duration-150">View all</a>' : ''}
+        </div>
+        ${recentEvents.length === 0 ? renderEmptyEvents() : renderEventsTable(recentEvents)}
+      </div>
+    </div>
+  `;
+}
+
+function renderEmptyEvents() {
+  return emptyState(
+    icons.empty,
+    'No events yet',
+    'Events will appear here once agents start sending telemetry data.',
+    ''
+  );
+}
+
+function renderEventsTable(events) {
+  return `
+    <div class="overflow-x-auto">
+      <table class="w-full">
+        <thead>
+          <tr class="bg-zinc-50 border-b border-zinc-200">
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Event</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Agent</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Host</th>
+            <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Errors</th>
+            <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Time</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${events.map((e, i) => `
+            <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === events.length - 1 ? 'border-b-0' : ''}">
+              <td class="px-6 py-3.5">
+                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium border ${eventColor(e.event_type)}">
+                  <span class="status-dot ${e.event_type}"></span>
+                  ${e.event_type}
+                </span>
+              </td>
+              <td class="px-6 py-3.5">
+                <span class="font-mono text-xs text-zinc-900">${truncate(e.instance_id, 12)}</span>
+              </td>
+              <td class="px-6 py-3.5 text-sm text-zinc-700">${e.hostname || '-'}</td>
+              <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(e.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(e.app?.total_errors)}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${formatTime(e.timestamp)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+// ============================================================
+// PAGE: AGENTS
+// ============================================================
+let agentsData = null;
+let agentsError = null;
+let agentsLoading = true;
+let agentsSearch = '';
+
+async function renderAgents() {
+  const title = $('#page-title');
+  if (title) title.textContent = 'Agents';
+
+  const main = $('#main-content');
+  if (main) main.innerHTML = skeletonCards(2) + '<div class="mt-6">' + skeletonTable(5, 6) + '</div>';
+
+  agentsLoading = true;
+  agentsError = null;
+  try {
+    const agents = await api('/api/agents');
+    if (!agents) return;
+    agentsData = agents;
+    agentsLoading = false;
+  } catch (err) {
+    agentsError = err.message;
+    agentsLoading = false;
+  }
+  renderAgentsContent();
+}
+
+function renderAgentsContent() {
+  const main = $('#main-content');
+  if (!main) return;
+
+  if (agentsLoading) {
+    main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + skeletonTable(5, 6) + '</div>';
+    return;
+  }
+
+  if (agentsError) {
+    main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + errorState(agentsError, () => { agentsLoading = true; renderAgents(); }) + '</div>';
+    return;
+  }
+
+  const filtered = agentsSearch
+    ? agentsData.filter(a => a.hostname?.toLowerCase().includes(agentsSearch.toLowerCase()) || a.instance_id?.toLowerCase().includes(agentsSearch.toLowerCase()))
+    : agentsData;
+
+  const onlineCount = agentsData.filter(a => a.status === 'online').length;
+  const appStats = aggregateAppStats(agentsData);
+
+  main.innerHTML = `
+    <div class="p-4 sm:p-6 lg:p-8 space-y-6 animate-fade-in">
+      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        ${statCard('Total Agents', agentsData.length, icons.serverSmall, '')}
+        ${statCard('Online', onlineCount, icons.check, 'text-green-600')}
+        ${statCard('Offline', agentsData.length - onlineCount, icons.alertCircle, 'text-zinc-400')}
+        ${statCard('Errors', formatNumber(appStats.total_errors), icons.alertCircle, appStats.total_errors ? 'text-red-600' : 'text-green-600')}
+      </div>
+
+      <div class="bg-white border border-zinc-200 shadow-sm rounded-xl overflow-hidden">
+        <div class="px-6 py-4 border-b border-zinc-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <h2 class="text-sm font-semibold text-zinc-900">Connected Agents</h2>
+          <div class="relative w-full sm:w-64">
+            <span class="absolute inset-y-0 left-3 flex items-center text-zinc-400">${icons.search}</span>
+            <input type="text" id="agent-search" value="${escHtml(agentsSearch)}" placeholder="Search agents\u2026" class="w-full bg-transparent border border-zinc-200 rounded-md pl-9 pr-3 py-1.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900/10 focus:border-zinc-900 transition-all duration-200">
+          </div>
+        </div>
+        ${filtered.length === 0 ? renderEmptyAgents() : renderAgentsTable(filtered)}
+      </div>
+    </div>
+  `;
+
+  const search = $('#agent-search');
+  if (search) {
+    search.addEventListener('input', e => {
+      agentsSearch = e.target.value;
+      renderAgentsContent();
+    });
+  }
+}
+
+function renderEmptyAgents() {
+  if (agentsSearch) {
+    return emptyState(icons.search, 'No agents match your search', 'Try a different search term.', '');
+  }
+  return emptyState(
+    icons.serverSmall,
+    'No agents connected',
+    'Agents will appear here once they start sending telemetry data.',
+    ''
+  );
+}
+
+function renderAgentsTable(agents) {
+  return `
+    <div class="overflow-x-auto">
+      <table class="w-full">
+        <thead>
+          <tr class="bg-zinc-50 border-b border-zinc-200">
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Status</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Instance ID</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Hostname</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Platform</th>
+            <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Go</th>
+            <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Events</th>
+            <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Errors</th>
+            <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Last Seen</th>
+            <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${agents.map((a, i) => `
+            <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === agents.length - 1 ? 'border-b-0' : ''}">
+              <td class="px-6 py-3.5">
+                <span class="status-dot ${a.status}"></span>
+              </td>
+              <td class="px-6 py-3.5">
+                <div class="flex items-center gap-2">
+                  <span class="font-mono text-xs text-zinc-900">${truncate(a.instance_id, 16)}</span>
+                  <button onclick="copyToClipboard('${a.instance_id}')" class="text-zinc-300 hover:text-zinc-500 transition-colors duration-150" aria-label="Copy instance ID">${icons.copy}</button>
+                </div>
+              </td>
+              <td class="px-6 py-3.5 text-sm text-zinc-700 font-medium">${a.hostname || '-'}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${(a.os || '') + '/' + (a.arch || '')}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${a.go_version || '-'}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-700 font-mono text-right tabular-nums">${a.heartbeats?.toLocaleString() || 0}</td>
+              <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(a.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(a.app?.total_errors)}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${formatTime(a.last_seen)}</td>
+              <td class="px-6 py-3.5 text-right">
+                <a href="/agents/${a.instance_id}" onclick="event.preventDefault(); navigate('/agents/${a.instance_id}')" class="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 transition-colors duration-150">View ${icons.chevronRight}</a>
+              </td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ============================================================
+// PAGE: AGENT DETAIL
+// ============================================================
+let agentDetailData = null;
+let agentDetailError = null;
+let agentDetailLoading = true;
+
+async function renderAgentDetail(id) {
+  const title = $('#page-title');
+  if (title) title.textContent = 'Agent Details';
+
+  const main = $('#main-content');
+  if (main) main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8 space-y-6">' + skeletonCards(1) + '<div class="bg-white border border-zinc-200 rounded-xl"><div class="px-6 py-4 border-b border-zinc-100"><div class="skeleton h-5 w-24"></div></div>' + skeletonTable(4, 3) + '</div></div>';
+
+  agentDetailLoading = true;
+  agentDetailError = null;
+  try {
+    const data = await api('/api/agents/' + encodeURIComponent(id));
+    if (!data) return;
+    if (data.error) { throw new Error(data.error); }
+    agentDetailData = data;
+    agentDetailLoading = false;
+  } catch (err) {
+    agentDetailError = err.message;
+    agentDetailLoading = false;
+  }
+  renderAgentDetailContent(id);
+}
+
+function renderAgentDetailContent(id) {
+  const main = $('#main-content');
+  if (!main) return;
+
+  if (agentDetailLoading) {
+    return;
+  }
+
+  if (agentDetailError) {
+    main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + errorState(agentDetailError, () => { agentDetailLoading = true; renderAgentDetail(id); }) + '</div>';
+    return;
+  }
+
+  const { agent, events } = agentDetailData;
+
+  if (!agent) {
+    main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + emptyState(icons.alertCircle, 'Agent not found', 'This agent may have disconnected or never existed.', '<a href="/agents" onclick="event.preventDefault(); navigate(\'/agents\')" class="bg-white border border-zinc-200 text-zinc-900 rounded-md px-4 py-2 text-sm font-medium hover:bg-zinc-50 transition-colors duration-150">Back to agents</a>') + '</div>';
+    return;
+  }
+
+  const statusLabel = agent.status === 'online' ? 'Online' : 'Offline';
+  const statusBadge = agent.status === 'online'
+    ? 'bg-green-50 text-green-700 border-green-200'
+    : 'bg-zinc-100 text-zinc-500 border-zinc-200';
+
+  main.innerHTML = `
+    <div class="p-4 sm:p-6 lg:p-8 space-y-6 animate-fade-in">
+      <div class="flex items-center gap-2 text-sm text-zinc-500 mb-2">
+        <a href="/agents" onclick="event.preventDefault(); navigate('/agents')" class="hover:text-zinc-900 transition-colors duration-150">Agents</a>
+        <span class="text-zinc-300">${icons.chevronRight}</span>
+        <span class="text-zinc-900 font-medium truncate">${agent.hostname || truncate(agent.instance_id, 12)}</span>
+      </div>
+
+      <div class="bg-white border border-zinc-200 shadow-sm rounded-xl">
+        <div class="px-6 py-4 border-b border-zinc-100 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-zinc-900">Agent Information</h2>
+          <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-xs font-medium border ${statusBadge}">
+            <span class="status-dot ${agent.status}"></span>
+            ${statusLabel}
+          </span>
+        </div>
+        <div class="p-6">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Instance ID</label>
+              <div class="mt-1 flex items-center gap-2">
+                <span class="font-mono text-sm text-zinc-900 break-all">${agent.instance_id}</span>
+                <button onclick="copyToClipboard('${agent.instance_id}')" class="text-zinc-300 hover:text-zinc-500 transition-colors duration-150 flex-shrink-0" aria-label="Copy">${icons.copy}</button>
+              </div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Hostname</label>
+              <div class="mt-1 text-sm text-zinc-900 font-medium">${agent.hostname || '-'}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Platform</label>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${agent.os || '-'} / ${agent.arch || '-'}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Go Version</label>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${agent.go_version || '-'}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Kernel</label>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${agent.kernel || '-'}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">CPU</label>
+              <div class="mt-1 text-sm text-zinc-700">${agent.cpu_model ? truncate(agent.cpu_model, 36) : '-'}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Memory / Disk</label>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${agent.ram_total_mb ? formatNumber(agent.ram_total_mb) + ' MB' : '-'} / ${agent.disk_total_mb ? formatNumber(agent.disk_total_mb) + ' MB' : '-'}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Uptime</label>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${formatDuration(agent.uptime)}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Heartbeats</label>
+              <div class="mt-1 text-sm text-zinc-700 font-mono tabular-nums">${agent.heartbeats?.toLocaleString() || 0}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">First Seen</label>
+              <div class="mt-1 text-sm text-zinc-500">${formatTimeFull(agent.first_seen)}</div>
+            </div>
+            <div>
+              <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Last Seen</label>
+              <div class="mt-1 text-sm text-zinc-500">${formatTimeFull(agent.last_seen)}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      ${renderTelemetryPanel(agent.app || null, { title: 'Agent Telemetry' })}
+
+      <div class="bg-white border border-zinc-200 shadow-sm rounded-xl overflow-hidden">
+        <div class="px-6 py-4 border-b border-zinc-100">
+          <h2 class="text-sm font-semibold text-zinc-900">Event History (${events.length})</h2>
+        </div>
+        ${events.length === 0
+          ? emptyState(icons.activity, 'No events from this agent', 'Events will appear as the agent sends telemetry data.', '')
+          : `
+            <div class="overflow-x-auto">
+              <table class="w-full">
+                <thead>
+                  <tr class="bg-zinc-50 border-b border-zinc-200">
+                    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Type</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Time</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Uptime</th>
+                    <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Errors</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${events.map((e, i) => `
+                    <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === events.length - 1 ? 'border-b-0' : ''}">
+                      <td class="px-6 py-3.5">
+                        <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium border ${eventColor(e.event_type)}">
+                          <span class="status-dot ${e.event_type}"></span>
+                          ${e.event_type}
+                        </span>
+                      </td>
+                      <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono whitespace-nowrap">${formatTimeFull(e.timestamp)}</td>
+                      <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${formatDuration(e.uptime)}</td>
+                      <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(e.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(e.app?.total_errors)}</td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          `}
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// PAGE: EVENTS
+// ============================================================
+let eventsData = null;
+let eventsError = null;
+let eventsLoading = true;
+
+async function renderEvents() {
+  const title = $('#page-title');
+  if (title) title.textContent = 'Events';
+
+  const main = $('#main-content');
+  if (main) main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + skeletonTable(8, 5) + '</div>';
+
+  eventsLoading = true;
+  eventsError = null;
+  try {
+    const events = await api('/api/events');
+    if (!events) return;
+    eventsData = events;
+    eventsLoading = false;
+  } catch (err) {
+    eventsError = err.message;
+    eventsLoading = false;
+  }
+  renderEventsContent();
+}
+
+function renderEventsContent() {
+  const main = $('#main-content');
+  if (!main) return;
+
+  if (eventsLoading) {
+    main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + skeletonTable(8, 5) + '</div>';
+    return;
+  }
+
+  if (eventsError) {
+    main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + errorState(eventsError, () => { eventsLoading = true; renderEvents(); }) + '</div>';
+    return;
+  }
+
+  if (eventsData.length === 0) {
+    main.innerHTML = '<div class="p-4 sm:p-6 lg:p-8">' + emptyState(icons.empty, 'No events received', 'Events will appear here once agents start sending telemetry data.', '') + '</div>';
+    return;
+  }
+
+  const appStats = aggregateAppStats(latestPerAgent(eventsData));
+
+  main.innerHTML = `
+    <div class="p-4 sm:p-6 lg:p-8 space-y-6 animate-fade-in">
+      ${renderTelemetryPanel(appStats, { title: 'Event Telemetry' })}
+
+      <div class="bg-white border border-zinc-200 shadow-sm rounded-xl overflow-hidden">
+        <div class="px-6 py-4 border-b border-zinc-100 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-zinc-900">Event Log (${eventsData.length})</h2>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full">
+            <thead>
+              <tr class="bg-zinc-50 border-b border-zinc-200">
+                <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Event</th>
+                <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Agent</th>
+                <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Hostname</th>
+                <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Platform</th>
+                <th class="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">Go</th>
+                <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Errors</th>
+                <th class="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${eventsData.map((e, i) => `
+                <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === eventsData.length - 1 ? 'border-b-0' : ''}">
+                  <td class="px-6 py-3.5">
+                    <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium border ${eventColor(e.event_type)}">
+                      <span class="status-dot ${e.event_type}"></span>
+                      ${e.event_type}
+                    </span>
+                  </td>
+                  <td class="px-6 py-3.5">
+                    <a href="/agents/${e.instance_id}" onclick="event.preventDefault(); navigate('/agents/${e.instance_id}')" class="font-mono text-xs text-blue-600 hover:text-blue-700 transition-colors duration-150">${truncate(e.instance_id, 16)}</a>
+                  </td>
+                  <td class="px-6 py-3.5 text-sm text-zinc-700">${e.hostname || '-'}</td>
+                  <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${(e.os || '-') + '/' + (e.arch || '-')}</td>
+                  <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${e.go_version || '-'}</td>
+                  <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(e.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(e.app?.total_errors)}</td>
+                  <td class="px-6 py-3.5 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${formatTime(e.timestamp)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// PAGE: 404
+// ============================================================
+function renderNotFound() {
+  const title = $('#page-title');
+  if (title) title.textContent = 'Not Found';
+
+  const main = $('#main-content');
+  if (!main) return;
+
+  main.innerHTML = `
+    <div class="flex flex-col items-center justify-center py-24 px-4 animate-fade-in">
+      <div class="text-zinc-300 mb-4">${icons.server}</div>
+      <h2 class="text-lg font-semibold text-zinc-900 mb-1">Page not found</h2>
+      <p class="text-sm text-zinc-500 text-center max-w-sm mb-6">The page you're looking for doesn't exist or has been moved.</p>
+      <a href="/" onclick="event.preventDefault(); navigate('/')" class="bg-zinc-900 text-white rounded-md px-4 py-2 text-sm font-medium hover:bg-zinc-800 transition-colors duration-150">Go to Dashboard</a>
+    </div>
+  `;
+}
+
+// ============================================================
+// AUTO-REFRESH
+// ============================================================
+function startRefresh(interval) {
+  refreshInterval = setInterval(() => {
+    const path = window.location.pathname;
+    if (path === '/') { dashboardLoading = true; renderDashboard(); }
+    else if (path === '/agents') { agentsLoading = true; renderAgents(); }
+    else if (path === '/events') { eventsLoading = true; renderEvents(); }
+  }, interval);
+}
+
+// ============================================================
+// INIT
+// ============================================================
+render();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) render();
+});
+</script>
+</body>
+</html>
