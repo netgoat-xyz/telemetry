@@ -127,7 +127,8 @@ function formatDuration(s) {
 
 function truncate(str, n) {
   if (!str) return '-';
-  return str.length > n ? str.slice(0, n) + '\u2026' : str;
+  const value = String(str);
+  return value.length > n ? value.slice(0, n) + '\u2026' : value;
 }
 
 function copyToClipboard(text) {
@@ -159,7 +160,8 @@ function percent(part, total) {
 function mergeCountMaps(target, source) {
   if (!source) return target;
   Object.entries(source).forEach(([key, value]) => {
-    target[key] = (target[key] || 0) + Number(value || 0);
+    const previous = Object.prototype.hasOwnProperty.call(target, key) ? target[key] : 0;
+    target[key] = previous + Number(value || 0);
   });
   return target;
 }
@@ -173,12 +175,12 @@ function aggregateAppStats(items) {
     proxy_errors: 0,
     total_errors: 0,
     avg_latency_ms: 0,
-    status_codes: {},
-    block_reasons: {},
-    error_status_codes: {},
+    status_codes: Object.create(null),
+    block_reasons: Object.create(null),
+    error_status_codes: Object.create(null),
     recent_errors: [],
   };
-  let latencyCount = 0;
+  let latencyWeight = 0;
   (items || []).forEach(item => {
     const app = item?.app;
     if (!app) return;
@@ -189,8 +191,9 @@ function aggregateAppStats(items) {
     aggregate.proxy_errors += Number(app.proxy_errors || 0);
     aggregate.total_errors += Number(app.total_errors || 0);
     if (Number(app.avg_latency_ms) > 0) {
-      aggregate.avg_latency_ms += Number(app.avg_latency_ms);
-      latencyCount++;
+      const weight = Math.max(1, Number(app.requests || 0));
+      aggregate.avg_latency_ms += Number(app.avg_latency_ms) * weight;
+      latencyWeight += weight;
     }
     mergeCountMaps(aggregate.status_codes, app.status_codes);
     mergeCountMaps(aggregate.block_reasons, app.block_reasons);
@@ -199,7 +202,7 @@ function aggregateAppStats(items) {
       aggregate.recent_errors.push(...app.recent_errors.map(err => ({ ...err, host: item.hostname, agent: item.instance_id })));
     }
   });
-  aggregate.avg_latency_ms = latencyCount ? aggregate.avg_latency_ms / latencyCount : 0;
+  aggregate.avg_latency_ms = latencyWeight ? aggregate.avg_latency_ms / latencyWeight : 0;
   aggregate.recent_errors.sort((a, b) => new Date(b.last_seen || 0) - new Date(a.last_seen || 0));
   aggregate.recent_errors = aggregate.recent_errors.slice(0, 8);
   return aggregate;
@@ -241,6 +244,18 @@ function eventColor(type) {
   return 'bg-zinc-100 text-zinc-700 border-zinc-200';
 }
 
+function eventStatusClass(type) {
+  return ['startup', 'shutdown', 'heartbeat'].includes(type) ? type : '';
+}
+
+function agentStatusClass(status) {
+  return status === 'online' ? 'online' : 'offline';
+}
+
+function agentRoute(instanceId) {
+  return '/agents/' + encodeURIComponent(String(instanceId || ''));
+}
+
 // ============================================================
 // API CLIENT
 // ============================================================
@@ -251,7 +266,7 @@ async function api(path, options = {}) {
   }
   try {
     const res = await fetch(path, { ...options, headers });
-    if (res.status === 401) {
+    if (res.status === 401 && path !== '/api/login') {
       state.token = null;
       state.user = null;
       localStorage.removeItem('telemetry_token');
@@ -286,7 +301,7 @@ window.addEventListener('popstate', render);
 let refreshInterval = null;
 
 function render() {
-  clearInterval(refreshInterval);
+  clearTimeout(refreshInterval);
   refreshInterval = null;
 
   const path = window.location.pathname;
@@ -301,16 +316,26 @@ function render() {
 
   renderLayout('');
 
+  let pageLoad = null;
   if (path === '/') {
-    renderDashboard();
+    pageLoad = renderDashboard();
   } else if (path === '/agents') {
-    renderAgents();
+    pageLoad = renderAgents();
   } else if (/^\/agents\//.test(path)) {
-    renderAgentDetail(path.replace('/agents/', ''));
+    try {
+      pageLoad = renderAgentDetail(decodeURIComponent(path.slice('/agents/'.length)));
+    } catch {
+      renderNotFound();
+    }
   } else if (path === '/events') {
-    renderEvents();
+    pageLoad = renderEvents();
   } else {
     renderNotFound();
+  }
+  if (pageLoad) {
+    Promise.resolve(pageLoad).finally(() => {
+      if (window.location.pathname === path && state.token && !document.hidden) startRefresh(10000);
+    });
   }
 }
 
@@ -338,7 +363,7 @@ function renderLayout(content) {
         <div class="border-t border-zinc-200 px-3 py-3 space-y-1">
           <div class="flex items-center gap-3 px-3 py-2 text-sm text-zinc-500">
             <span class="flex items-center justify-center w-7 h-7 rounded-full bg-zinc-100 text-zinc-500">${icons.user}</span>
-            <span class="truncate">${state.user || 'admin'}</span>
+            <span class="truncate">${escHtml(state.user || 'admin')}</span>
           </div>
           <button onclick="handleLogout()" class="flex items-center gap-3 w-full px-3 py-2 rounded-md text-sm font-medium text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50 transition-colors duration-150" aria-label="Sign out">${icons.logout} Sign out</button>
         </div>
@@ -431,7 +456,7 @@ function errorState(message, onRetry) {
     <div class="flex flex-col items-center justify-center py-16 px-4">
       <div class="text-red-400 mb-4">${icons.alertCircle}</div>
       <h3 class="text-sm font-semibold text-zinc-900 mb-1">Something went wrong</h3>
-      <p class="text-sm text-zinc-500 text-center max-w-sm mb-6">${message}</p>
+      <p class="text-sm text-zinc-500 text-center max-w-sm mb-6">${escHtml(message)}</p>
       <button onclick="(${onRetry.toString()})()" class="bg-white border border-zinc-200 text-zinc-900 rounded-md px-4 py-2 text-sm font-medium hover:bg-zinc-50 active:bg-zinc-100 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-zinc-900/20 focus-visible:ring-offset-2">Try again</button>
     </div>
   `;
@@ -548,7 +573,7 @@ function renderRecentErrors(errors) {
                     <span class="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium border ${err.kind === 'proxy' ? 'bg-red-50 text-red-700 border-red-200' : 'bg-amber-50 text-amber-700 border-amber-200'}">${escHtml(err.kind || 'error')}</span>
                   </td>
                   <td class="px-4 py-3 text-sm text-zinc-700 max-w-md truncate" title="${escHtml(err.message || '')}">${escHtml(err.message || '-')}</td>
-                  <td class="px-4 py-3 text-xs text-zinc-500 font-mono">${truncate(err.host || err.agent || '-', 18)}</td>
+                  <td class="px-4 py-3 text-xs text-zinc-500 font-mono">${escHtml(truncate(err.host || err.agent || '-', 18))}</td>
                   <td class="px-4 py-3 text-sm text-zinc-700 font-mono text-right tabular-nums">${formatNumber(err.count)}</td>
                   <td class="px-4 py-3 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${err.last_seen ? formatTime(err.last_seen) : '-'}</td>
                 </tr>
@@ -606,7 +631,7 @@ function renderLogin() {
           </form>
         </div>
 
-        <p class="text-center text-xs text-zinc-400 mt-6">Default: <span class="font-mono text-zinc-500">admin</span> / <span class="font-mono text-zinc-500">admin</span></p>
+        <p class="text-center text-xs text-zinc-400 mt-6">Use the administrator credentials configured on the server.</p>
       </div>
     </div>
   `;
@@ -652,8 +677,10 @@ async function handleLogin(e) {
 let dashboardData = null;
 let dashboardError = null;
 let dashboardLoading = true;
+let dashboardRequest = 0;
 
 async function renderDashboard() {
+  const requestId = ++dashboardRequest;
   const title = $('#page-title');
   if (title) title.textContent = 'Dashboard';
 
@@ -665,13 +692,14 @@ async function renderDashboard() {
   try {
     const [stats, events, agents] = await Promise.all([
       api('/api/stats'),
-      api('/api/events'),
+      api('/api/events?limit=10'),
       api('/api/agents'),
     ]);
-    if (!stats || !events || !agents) return;
+    if (!stats || !events || !agents || requestId !== dashboardRequest || window.location.pathname !== '/') return;
     dashboardData = { stats, events, agents };
     dashboardLoading = false;
   } catch (err) {
+    if (requestId !== dashboardRequest || window.location.pathname !== '/') return;
     dashboardError = err.message;
     dashboardLoading = false;
   }
@@ -748,14 +776,14 @@ function renderEventsTable(events) {
             <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === events.length - 1 ? 'border-b-0' : ''}">
               <td class="px-6 py-3.5">
                 <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium border ${eventColor(e.event_type)}">
-                  <span class="status-dot ${e.event_type}"></span>
-                  ${e.event_type}
+                  <span class="status-dot ${eventStatusClass(e.event_type)}"></span>
+                  ${escHtml(e.event_type || 'event')}
                 </span>
               </td>
               <td class="px-6 py-3.5">
-                <span class="font-mono text-xs text-zinc-900">${truncate(e.instance_id, 12)}</span>
+                <span class="font-mono text-xs text-zinc-900">${escHtml(truncate(e.instance_id, 12))}</span>
               </td>
-              <td class="px-6 py-3.5 text-sm text-zinc-700">${e.hostname || '-'}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-700">${escHtml(e.hostname || '-')}</td>
               <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(e.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(e.app?.total_errors)}</td>
               <td class="px-6 py-3.5 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${formatTime(e.timestamp)}</td>
             </tr>
@@ -773,8 +801,10 @@ let agentsData = null;
 let agentsError = null;
 let agentsLoading = true;
 let agentsSearch = '';
+let agentsRequest = 0;
 
 async function renderAgents() {
+  const requestId = ++agentsRequest;
   const title = $('#page-title');
   if (title) title.textContent = 'Agents';
 
@@ -785,17 +815,18 @@ async function renderAgents() {
   agentsError = null;
   try {
     const agents = await api('/api/agents');
-    if (!agents) return;
+    if (!agents || requestId !== agentsRequest || window.location.pathname !== '/agents') return;
     agentsData = agents;
     agentsLoading = false;
   } catch (err) {
+    if (requestId !== agentsRequest || window.location.pathname !== '/agents') return;
     agentsError = err.message;
     agentsLoading = false;
   }
   renderAgentsContent();
 }
 
-function renderAgentsContent() {
+function renderAgentsContent(focusSearch = false) {
   const main = $('#main-content');
   if (!main) return;
 
@@ -842,8 +873,12 @@ function renderAgentsContent() {
   if (search) {
     search.addEventListener('input', e => {
       agentsSearch = e.target.value;
-      renderAgentsContent();
+      renderAgentsContent(true);
     });
+    if (focusSearch) {
+      search.focus();
+      search.setSelectionRange(agentsSearch.length, agentsSearch.length);
+    }
   }
 }
 
@@ -880,22 +915,22 @@ function renderAgentsTable(agents) {
           ${agents.map((a, i) => `
             <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === agents.length - 1 ? 'border-b-0' : ''}">
               <td class="px-6 py-3.5">
-                <span class="status-dot ${a.status}"></span>
+                <span class="status-dot ${agentStatusClass(a.status)}"></span>
               </td>
               <td class="px-6 py-3.5">
                 <div class="flex items-center gap-2">
-                  <span class="font-mono text-xs text-zinc-900">${truncate(a.instance_id, 16)}</span>
-                  <button onclick="copyToClipboard('${a.instance_id}')" class="text-zinc-300 hover:text-zinc-500 transition-colors duration-150" aria-label="Copy instance ID">${icons.copy}</button>
+                  <span class="font-mono text-xs text-zinc-900">${escHtml(truncate(a.instance_id, 16))}</span>
+                  <button data-copy="${escHtml(a.instance_id)}" class="text-zinc-300 hover:text-zinc-500 transition-colors duration-150" aria-label="Copy instance ID">${icons.copy}</button>
                 </div>
               </td>
-              <td class="px-6 py-3.5 text-sm text-zinc-700 font-medium">${a.hostname || '-'}</td>
-              <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${(a.os || '') + '/' + (a.arch || '')}</td>
-              <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${a.go_version || '-'}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-700 font-medium">${escHtml(a.hostname || '-')}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${escHtml((a.os || '') + '/' + (a.arch || ''))}</td>
+              <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${escHtml(a.go_version || '-')}</td>
               <td class="px-6 py-3.5 text-sm text-zinc-700 font-mono text-right tabular-nums">${a.heartbeats?.toLocaleString() || 0}</td>
               <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(a.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(a.app?.total_errors)}</td>
               <td class="px-6 py-3.5 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${formatTime(a.last_seen)}</td>
               <td class="px-6 py-3.5 text-right">
-                <a href="/agents/${a.instance_id}" onclick="event.preventDefault(); navigate('/agents/${a.instance_id}')" class="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 transition-colors duration-150">View ${icons.chevronRight}</a>
+                <a href="${agentRoute(a.instance_id)}" data-agent-route class="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 transition-colors duration-150">View ${icons.chevronRight}</a>
               </td>
             </tr>
           `).join('')}
@@ -906,8 +941,9 @@ function renderAgentsTable(agents) {
 }
 
 function escHtml(s) {
-  if (!s) return '';
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[c]);
 }
 
 // ============================================================
@@ -916,8 +952,10 @@ function escHtml(s) {
 let agentDetailData = null;
 let agentDetailError = null;
 let agentDetailLoading = true;
+let agentDetailRequest = 0;
 
 async function renderAgentDetail(id) {
+  const requestId = ++agentDetailRequest;
   const title = $('#page-title');
   if (title) title.textContent = 'Agent Details';
 
@@ -928,11 +966,12 @@ async function renderAgentDetail(id) {
   agentDetailError = null;
   try {
     const data = await api('/api/agents/' + encodeURIComponent(id));
-    if (!data) return;
+    if (!data || requestId !== agentDetailRequest || window.location.pathname !== agentRoute(id)) return;
     if (data.error) { throw new Error(data.error); }
     agentDetailData = data;
     agentDetailLoading = false;
   } catch (err) {
+    if (requestId !== agentDetailRequest || window.location.pathname !== agentRoute(id)) return;
     agentDetailError = err.message;
     agentDetailLoading = false;
   }
@@ -969,14 +1008,14 @@ function renderAgentDetailContent(id) {
       <div class="flex items-center gap-2 text-sm text-zinc-500 mb-2">
         <a href="/agents" onclick="event.preventDefault(); navigate('/agents')" class="hover:text-zinc-900 transition-colors duration-150">Agents</a>
         <span class="text-zinc-300">${icons.chevronRight}</span>
-        <span class="text-zinc-900 font-medium truncate">${agent.hostname || truncate(agent.instance_id, 12)}</span>
+        <span class="text-zinc-900 font-medium truncate">${escHtml(agent.hostname || truncate(agent.instance_id, 12))}</span>
       </div>
 
       <div class="bg-white border border-zinc-200 shadow-sm rounded-xl">
         <div class="px-6 py-4 border-b border-zinc-100 flex items-center justify-between">
           <h2 class="text-sm font-semibold text-zinc-900">Agent Information</h2>
           <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-xs font-medium border ${statusBadge}">
-            <span class="status-dot ${agent.status}"></span>
+            <span class="status-dot ${agentStatusClass(agent.status)}"></span>
             ${statusLabel}
           </span>
         </div>
@@ -985,29 +1024,29 @@ function renderAgentDetailContent(id) {
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Instance ID</label>
               <div class="mt-1 flex items-center gap-2">
-                <span class="font-mono text-sm text-zinc-900 break-all">${agent.instance_id}</span>
-                <button onclick="copyToClipboard('${agent.instance_id}')" class="text-zinc-300 hover:text-zinc-500 transition-colors duration-150 flex-shrink-0" aria-label="Copy">${icons.copy}</button>
+                <span class="font-mono text-sm text-zinc-900 break-all">${escHtml(agent.instance_id)}</span>
+                <button data-copy="${escHtml(agent.instance_id)}" class="text-zinc-300 hover:text-zinc-500 transition-colors duration-150 flex-shrink-0" aria-label="Copy">${icons.copy}</button>
               </div>
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Hostname</label>
-              <div class="mt-1 text-sm text-zinc-900 font-medium">${agent.hostname || '-'}</div>
+              <div class="mt-1 text-sm text-zinc-900 font-medium">${escHtml(agent.hostname || '-')}</div>
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Platform</label>
-              <div class="mt-1 text-sm text-zinc-700 font-mono">${agent.os || '-'} / ${agent.arch || '-'}</div>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${escHtml(agent.os || '-')} / ${escHtml(agent.arch || '-')}</div>
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Go Version</label>
-              <div class="mt-1 text-sm text-zinc-700 font-mono">${agent.go_version || '-'}</div>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${escHtml(agent.go_version || '-')}</div>
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Kernel</label>
-              <div class="mt-1 text-sm text-zinc-700 font-mono">${agent.kernel || '-'}</div>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${escHtml(agent.kernel || '-')}</div>
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">CPU</label>
-              <div class="mt-1 text-sm text-zinc-700">${agent.cpu_model ? truncate(agent.cpu_model, 36) : '-'}</div>
+              <div class="mt-1 text-sm text-zinc-700">${escHtml(agent.cpu_model ? truncate(agent.cpu_model, 36) : '-')}</div>
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Memory / Disk</label>
@@ -1015,7 +1054,7 @@ function renderAgentDetailContent(id) {
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Uptime</label>
-              <div class="mt-1 text-sm text-zinc-700 font-mono">${formatDuration(agent.uptime)}</div>
+              <div class="mt-1 text-sm text-zinc-700 font-mono">${escHtml(formatDuration(agent.uptime))}</div>
             </div>
             <div>
               <label class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Heartbeats</label>
@@ -1057,12 +1096,12 @@ function renderAgentDetailContent(id) {
                     <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === events.length - 1 ? 'border-b-0' : ''}">
                       <td class="px-6 py-3.5">
                         <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium border ${eventColor(e.event_type)}">
-                          <span class="status-dot ${e.event_type}"></span>
-                          ${e.event_type}
+                          <span class="status-dot ${eventStatusClass(e.event_type)}"></span>
+                          ${escHtml(e.event_type || 'event')}
                         </span>
                       </td>
                       <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono whitespace-nowrap">${formatTimeFull(e.timestamp)}</td>
-                      <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${formatDuration(e.uptime)}</td>
+                      <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${escHtml(formatDuration(e.uptime))}</td>
                       <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(e.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(e.app?.total_errors)}</td>
                     </tr>
                   `).join('')}
@@ -1081,8 +1120,10 @@ function renderAgentDetailContent(id) {
 let eventsData = null;
 let eventsError = null;
 let eventsLoading = true;
+let eventsRequest = 0;
 
 async function renderEvents() {
+  const requestId = ++eventsRequest;
   const title = $('#page-title');
   if (title) title.textContent = 'Events';
 
@@ -1093,10 +1134,11 @@ async function renderEvents() {
   eventsError = null;
   try {
     const events = await api('/api/events');
-    if (!events) return;
+    if (!events || requestId !== eventsRequest || window.location.pathname !== '/events') return;
     eventsData = events;
     eventsLoading = false;
   } catch (err) {
+    if (requestId !== eventsRequest || window.location.pathname !== '/events') return;
     eventsError = err.message;
     eventsLoading = false;
   }
@@ -1150,16 +1192,16 @@ function renderEventsContent() {
                 <tr class="border-b border-zinc-100 hover:bg-zinc-50 transition-colors duration-150 ${i === eventsData.length - 1 ? 'border-b-0' : ''}">
                   <td class="px-6 py-3.5">
                     <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium border ${eventColor(e.event_type)}">
-                      <span class="status-dot ${e.event_type}"></span>
-                      ${e.event_type}
+                      <span class="status-dot ${eventStatusClass(e.event_type)}"></span>
+                      ${escHtml(e.event_type || 'event')}
                     </span>
                   </td>
                   <td class="px-6 py-3.5">
-                    <a href="/agents/${e.instance_id}" onclick="event.preventDefault(); navigate('/agents/${e.instance_id}')" class="font-mono text-xs text-blue-600 hover:text-blue-700 transition-colors duration-150">${truncate(e.instance_id, 16)}</a>
+                    <a href="${agentRoute(e.instance_id)}" data-agent-route class="font-mono text-xs text-blue-600 hover:text-blue-700 transition-colors duration-150">${escHtml(truncate(e.instance_id, 16))}</a>
                   </td>
-                  <td class="px-6 py-3.5 text-sm text-zinc-700">${e.hostname || '-'}</td>
-                  <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${(e.os || '-') + '/' + (e.arch || '-')}</td>
-                  <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${e.go_version || '-'}</td>
+                  <td class="px-6 py-3.5 text-sm text-zinc-700">${escHtml(e.hostname || '-')}</td>
+                  <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${escHtml((e.os || '-') + '/' + (e.arch || '-'))}</td>
+                  <td class="px-6 py-3.5 text-sm text-zinc-500 font-mono">${escHtml(e.go_version || '-')}</td>
                   <td class="px-6 py-3.5 text-sm font-mono text-right tabular-nums ${(e.app?.total_errors || 0) > 0 ? 'text-red-600' : 'text-zinc-400'}">${formatNumber(e.app?.total_errors)}</td>
                   <td class="px-6 py-3.5 text-sm text-zinc-400 font-mono text-right whitespace-nowrap">${formatTime(e.timestamp)}</td>
                 </tr>
@@ -1196,17 +1238,38 @@ function renderNotFound() {
 // AUTO-REFRESH
 // ============================================================
 function startRefresh(interval) {
-  refreshInterval = setInterval(() => {
+  clearTimeout(refreshInterval);
+  refreshInterval = setTimeout(async () => {
+    refreshInterval = null;
+    if (document.hidden || !state.token) return;
     const path = window.location.pathname;
-    if (path === '/') { dashboardLoading = true; renderDashboard(); }
-    else if (path === '/agents') { agentsLoading = true; renderAgents(); }
-    else if (path === '/events') { eventsLoading = true; renderEvents(); }
+    try {
+      if (path === '/') await renderDashboard();
+      else if (path === '/agents') await renderAgents();
+      else if (path === '/events') await renderEvents();
+      else if (/^\/agents\//.test(path)) await renderAgentDetail(decodeURIComponent(path.slice('/agents/'.length)));
+    } finally {
+      if (window.location.pathname === path && state.token && !document.hidden) startRefresh(interval);
+    }
   }, interval);
 }
 
 // ============================================================
 // INIT
 // ============================================================
+document.addEventListener('click', event => {
+  const copyButton = event.target.closest('[data-copy]');
+  if (copyButton) {
+    copyToClipboard(copyButton.dataset.copy || '');
+    return;
+  }
+  const agentLink = event.target.closest('[data-agent-route]');
+  if (agentLink) {
+    event.preventDefault();
+    navigate(agentLink.getAttribute('href'));
+  }
+});
+
 render();
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) render();
