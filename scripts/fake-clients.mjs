@@ -3,12 +3,14 @@ import { randomUUID } from "node:crypto";
 
 const defaults = {
   endpoint: "http://localhost:9091/api/telemetry",
-  clients: 100, // Increased default
+  clients: 100,
   rounds: 16,
   interval: 400,
+  concurrency: 50,
   errorRate: 0.38,
   seed: Date.now(),
   shutdown: false,
+  ingestKey: process.env.TELEMETRY_INGEST_KEY || "",
 };
 
 const colors = {
@@ -83,7 +85,7 @@ function parseArgs(argv) {
       printHelp();
       process.exit(0);
     }
-    if (!arg.startsWith("--")) continue;
+    if (!arg.startsWith("--")) fail(`Unexpected argument: ${arg}`);
     const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
     const key = rawKey.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     if (key === "shutdown") {
@@ -97,12 +99,18 @@ function parseArgs(argv) {
     }
   }
 
-  // Removed upper limit on clients for scalability
   opts.clients = clampInt(opts.clients, 1, 100000, "clients");
   opts.rounds = clampInt(opts.rounds, 0, 10000, "rounds");
   opts.interval = clampInt(opts.interval, 0, 60000, "interval");
+  opts.concurrency = clampInt(opts.concurrency, 1, 500, "concurrency");
   opts.errorRate = clampFloat(opts.errorRate, 0, 1, "error-rate");
   opts.seed = Number(opts.seed) || Date.now();
+  try {
+    const endpoint = new URL(opts.endpoint);
+    if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") throw new Error("unsupported protocol");
+  } catch {
+    fail("endpoint must be a valid HTTP(S) URL");
+  }
   return opts;
 }
 
@@ -117,16 +125,18 @@ Options:
   --clients <n>          Number of fake clients.
   --rounds <n>           Heartbeat rounds after startup.
   --interval <ms>        Delay between rounds.
+  --concurrency <n>      Maximum simultaneous requests. Default: ${defaults.concurrency}
   --error-rate <0..1>    Chance each client emits new errors per round.
   --seed <n>             Reproducible random seed.
+  --ingest-key <value>   Shared ingestion key. Defaults to TELEMETRY_INGEST_KEY.
   --shutdown             Send shutdown events at the end
 `);
 }
 
 function clampInt(value, min, max, label) {
   const n = Number.parseInt(String(value), 10);
-  if (!Number.isFinite(n) || n < min) {
-    fail(`${label} must be at least ${min}`);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    fail(`${label} must be between ${min} and ${max}`);
   }
   return n;
 }
@@ -293,11 +303,14 @@ function formatUptime(ms) {
   return `${seconds}s`;
 }
 
-async function postTelemetry(endpoint, payload) {
+async function postTelemetry(endpoint, payload, ingestKey) {
+  const headers = { "Content-Type": "application/json" };
+  if (ingestKey) headers["X-Telemetry-Key"] = ingestKey;
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -310,17 +323,20 @@ function sleep(ms) {
 }
 
 async function sendRound(endpoint, clients, rng, opts, eventType) {
+  const payloads = clients.map((client) => mutateClient(rng, client, opts, eventType));
   let errors = 0;
-  // Note: For massive client counts, you might want to chunk this
-  await Promise.all(
-    clients.map(async (client) => {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(opts.concurrency, payloads.length) }, async () => {
+    while (next < payloads.length) {
+      const index = next++;
       try {
-        await postTelemetry(endpoint, mutateClient(rng, client, opts, eventType));
+        await postTelemetry(endpoint, payloads[index], opts.ingestKey);
       } catch (err) {
         errors++;
       }
-    }),
-  );
+    }
+  });
+  await Promise.all(workers);
   return errors;
 }
 
@@ -329,7 +345,7 @@ async function main() {
   const rng = mulberry32(opts.seed);
   const clients = Array.from({ length: opts.clients }, (_, i) => makeClient(rng, i));
 
-  log("info", `endpoint=${opts.endpoint} clients=${opts.clients} rounds=${opts.rounds} interval=${opts.interval}ms error_rate=${opts.errorRate}`);
+  log("info", `endpoint=${opts.endpoint} clients=${opts.clients} rounds=${opts.rounds} interval=${opts.interval}ms concurrency=${opts.concurrency} error_rate=${opts.errorRate}`);
 
   let failed = await sendRound(opts.endpoint, clients, rng, opts, "startup");
   log(failed ? "warn" : "info", `startup sent (${opts.clients - failed}/${opts.clients})`);

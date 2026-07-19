@@ -2,36 +2,65 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var jwtSecret []byte
 var adminUsers = map[string]string{}
+var configuredIngestKey []byte
+var usingDefaultAdmin bool
+var usingEphemeralJWT bool
+
+const jwtHeader = `{"alg":"HS256","typ":"JWT"}`
+
+//go:embed static/index.html
+var dashboardHTML []byte
 
 func init() {
 	secret := os.Getenv("TELEMETRY_JWT_SECRET")
 	if secret == "" {
-		secret = "telemetry-dev-secret"
+		generated := make([]byte, 32)
+		if _, err := rand.Read(generated); err != nil {
+			panic(fmt.Sprintf("generate ephemeral JWT secret: %v", err))
+		}
+		jwtSecret = generated
+		usingEphemeralJWT = true
+	} else {
+		jwtSecret = []byte(secret)
 	}
-	jwtSecret = []byte(secret)
 
+	username := os.Getenv("TELEMETRY_ADMIN_USERNAME")
+	if username == "" {
+		username = "admin"
+	}
 	pass := os.Getenv("TELEMETRY_ADMIN_PASSWORD")
 	if pass == "" {
 		pass = "admin"
+		usingDefaultAdmin = true
 	}
-	adminUsers["admin"] = pass
+	adminUsers[username] = pass
+	configuredIngestKey = []byte(os.Getenv("TELEMETRY_INGEST_KEY"))
 }
 
 type JWTClaims struct {
@@ -41,7 +70,6 @@ type JWTClaims struct {
 }
 
 func createToken(username string) (string, error) {
-	header := `{"alg":"HS256","typ":"JWT"}`
 	claims := JWTClaims{
 		Sub: username,
 		Exp: time.Now().Add(24 * time.Hour).Unix(),
@@ -52,7 +80,7 @@ func createToken(username string) (string, error) {
 		return "", err
 	}
 
-	encHeader := base64.RawURLEncoding.EncodeToString([]byte(header))
+	encHeader := base64.RawURLEncoding.EncodeToString([]byte(jwtHeader))
 	encPayload := base64.RawURLEncoding.EncodeToString(payload)
 
 	message := encHeader + "." + encPayload
@@ -66,6 +94,9 @@ func createToken(username string) (string, error) {
 func validateToken(token string) (string, bool) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
+		return "", false
+	}
+	if parts[0] != base64.RawURLEncoding.EncodeToString([]byte(jwtHeader)) {
 		return "", false
 	}
 
@@ -93,7 +124,11 @@ func validateToken(token string) (string, bool) {
 		return "", false
 	}
 
-	if time.Now().Unix() > claims.Exp {
+	now := time.Now().Unix()
+	if claims.Sub == "" || claims.Exp <= now || claims.Iat <= 0 || claims.Iat > now+60 {
+		return "", false
+	}
+	if _, ok := adminUsers[claims.Sub]; !ok {
 		return "", false
 	}
 
@@ -101,21 +136,21 @@ func validateToken(token string) (string, bool) {
 }
 
 type Payload struct {
-	InstanceID string    `json:"instance_id"`
-	Hostname   string    `json:"hostname"`
-	GoVersion  string    `json:"go_version"`
-	OS         string    `json:"os"`
-	Arch       string    `json:"arch"`
-	Kernel     string    `json:"kernel"`
-	CPUModel   string    `json:"cpu_model"`
-	CPUCores   int       `json:"cpu_cores"`
-	RAMTotalMB int64     `json:"ram_total_mb"`
-	DiskTotalMB int64    `json:"disk_total_mb"`
-	DiskFreeMB int64     `json:"disk_free_mb"`
-	Uptime     string    `json:"uptime"`
-	EventType  string    `json:"event_type"`
-	Timestamp  time.Time `json:"timestamp"`
-	App        *AppStats `json:"app,omitempty"`
+	InstanceID  string    `json:"instance_id"`
+	Hostname    string    `json:"hostname"`
+	GoVersion   string    `json:"go_version"`
+	OS          string    `json:"os"`
+	Arch        string    `json:"arch"`
+	Kernel      string    `json:"kernel"`
+	CPUModel    string    `json:"cpu_model"`
+	CPUCores    int       `json:"cpu_cores"`
+	RAMTotalMB  int64     `json:"ram_total_mb"`
+	DiskTotalMB int64     `json:"disk_total_mb"`
+	DiskFreeMB  int64     `json:"disk_free_mb"`
+	Uptime      string    `json:"uptime"`
+	EventType   string    `json:"event_type"`
+	Timestamp   time.Time `json:"timestamp"`
+	App         *AppStats `json:"app,omitempty"`
 }
 
 type ErrorInfo struct {
@@ -140,62 +175,79 @@ type AppStats struct {
 }
 
 type Event struct {
-	InstanceID string    `json:"instance_id"`
-	Hostname   string    `json:"hostname"`
-	EventType  string    `json:"event_type"`
-	Timestamp  time.Time `json:"timestamp"`
-	GoVersion  string    `json:"go_version"`
-	OS         string    `json:"os"`
-	Arch       string    `json:"arch"`
-	Kernel     string    `json:"kernel"`
-	CPUModel   string    `json:"cpu_model"`
-	CPUCores   int       `json:"cpu_cores"`
-	RAMTotalMB int64     `json:"ram_total_mb"`
-	DiskTotalMB int64    `json:"disk_total_mb"`
-	DiskFreeMB int64     `json:"disk_free_mb"`
-	Uptime     string    `json:"uptime"`
-	App        *AppStats `json:"app,omitempty"`
+	InstanceID  string    `json:"instance_id"`
+	Hostname    string    `json:"hostname"`
+	EventType   string    `json:"event_type"`
+	Timestamp   time.Time `json:"timestamp"`
+	GoVersion   string    `json:"go_version"`
+	OS          string    `json:"os"`
+	Arch        string    `json:"arch"`
+	Kernel      string    `json:"kernel"`
+	CPUModel    string    `json:"cpu_model"`
+	CPUCores    int       `json:"cpu_cores"`
+	RAMTotalMB  int64     `json:"ram_total_mb"`
+	DiskTotalMB int64     `json:"disk_total_mb"`
+	DiskFreeMB  int64     `json:"disk_free_mb"`
+	Uptime      string    `json:"uptime"`
+	App         *AppStats `json:"app,omitempty"`
 }
 
 type Agent struct {
-	InstanceID string    `json:"instance_id"`
-	Hostname   string    `json:"hostname"`
-	GoVersion  string    `json:"go_version"`
-	OS         string    `json:"os"`
-	Arch       string    `json:"arch"`
-	Kernel     string    `json:"kernel"`
-	CPUModel   string    `json:"cpu_model"`
-	CPUCores   int       `json:"cpu_cores"`
-	RAMTotalMB int64     `json:"ram_total_mb"`
-	DiskTotalMB int64    `json:"disk_total_mb"`
-	DiskFreeMB int64     `json:"disk_free_mb"`
-	Uptime     string    `json:"uptime"`
-	App        *AppStats `json:"app,omitempty"`
-	FirstSeen  time.Time `json:"first_seen"`
-	LastSeen   time.Time `json:"last_seen"`
-	Heartbeats int       `json:"heartbeats"`
-	Status     string    `json:"status"`
+	InstanceID  string    `json:"instance_id"`
+	Hostname    string    `json:"hostname"`
+	GoVersion   string    `json:"go_version"`
+	OS          string    `json:"os"`
+	Arch        string    `json:"arch"`
+	Kernel      string    `json:"kernel"`
+	CPUModel    string    `json:"cpu_model"`
+	CPUCores    int       `json:"cpu_cores"`
+	RAMTotalMB  int64     `json:"ram_total_mb"`
+	DiskTotalMB int64     `json:"disk_total_mb"`
+	DiskFreeMB  int64     `json:"disk_free_mb"`
+	Uptime      string    `json:"uptime"`
+	App         *AppStats `json:"app,omitempty"`
+	FirstSeen   time.Time `json:"first_seen"`
+	LastSeen    time.Time `json:"last_seen"`
+	Heartbeats  int       `json:"heartbeats"`
+	Status      string    `json:"status"`
+	LastEvent   string    `json:"last_event_type"`
 }
 
 type ServerStats struct {
 	Uptime      string `json:"uptime"`
 	Agents      int    `json:"agent_count"`
-	Events      int    `json:"total_events"`
+	Events      uint64 `json:"total_events"`
 	TotalErrors uint64 `json:"total_errors"`
 	StartedAt   string `json:"started_at"`
 }
 
 type Server struct {
-	mu      sync.RWMutex
-	agents  map[string]*Agent
-	events  []Event
-	total   int
-	errors  uint64
-	started time.Time
-	port    string
+	mu         sync.RWMutex
+	agents     map[string]*Agent
+	events     []Event
+	eventStart int
+	eventCount int
+	total      uint64
+	errors     uint64
+	started    time.Time
+	address    string
+	ingestKey  []byte
 }
 
-const maxEvents = 5000
+const (
+	maxEvents               = 5000
+	maxAgents               = 10000
+	defaultEventLimit       = 200
+	maxEventLimit           = 1000
+	maxTelemetryBodyBytes   = 128 << 10
+	maxLoginBodyBytes       = 4 << 10
+	maxInstanceIDBytes      = 160
+	maxTelemetryStringBytes = 512
+	maxMetricMapEntries     = 128
+	maxRecentErrors         = 32
+)
+
+var errBodyTooLarge = errors.New("request body too large")
 
 const (
 	ansiReset = "\x1b[0m"
@@ -208,20 +260,20 @@ const (
 	ansiCyan  = "\x1b[36m"
 )
 
-func NewServer(port string) *Server {
+func NewServer(address string) *Server {
 	return &Server{
-		agents:  make(map[string]*Agent),
-		events:  make([]Event, 0, maxEvents),
-		started: time.Now(),
-		port:    port,
+		agents:    make(map[string]*Agent),
+		events:    make([]Event, maxEvents),
+		started:   time.Now(),
+		address:   address,
+		ingestKey: append([]byte(nil), configuredIngestKey...),
 	}
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
+		if !strings.HasPrefix(auth, "Bearer ") || len(auth) == len("Bearer ") {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
@@ -234,19 +286,50 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (s *Server) ingestAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(s.ingestKey) > 0 && !constantTimeEqual(r.Header.Get("X-Telemetry-Key"), string(s.ingestKey)) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid telemetry key"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		if strings.HasPrefix(r.URL.Path, "/api") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func constantTimeEqual(left, right string) bool {
+	leftHash := sha256.Sum256([]byte(left))
+	rightHash := sha256.Sum256([]byte(right))
+	return subtle.ConstantTimeCompare(leftHash[:], rightHash[:]) == 1
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	var creds struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if err := decodeJSONBody(w, r, &creds, maxLoginBodyBytes); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 
 	expectedPass, ok := adminUsers[creds.Username]
-	if !ok || subtle.ConstantTimeCompare([]byte(creds.Password), []byte(expectedPass)) != 1 {
+	if !ok {
+		expectedPass = "invalid-credential-placeholder"
+	}
+	validPassword := constantTimeEqual(creds.Password, expectedPass)
+	if !ok || !validPassword {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 		return
 	}
@@ -264,9 +347,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	ids := make([]string, 0, len(s.agents))
 	for id := range s.agents {
@@ -275,38 +356,16 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(ids)
 
 	agents := make([]Agent, len(ids))
+	now := time.Now()
 	for i, id := range ids {
-		a := s.agents[id]
-		status := "online"
-		if time.Since(a.LastSeen) > 5*time.Minute {
-			status = "offline"
-		}
-		agents[i] = Agent{
-			InstanceID: a.InstanceID,
-			Hostname:   a.Hostname,
-			GoVersion:  a.GoVersion,
-			OS:         a.OS,
-			Arch:       a.Arch,
-			Kernel:     a.Kernel,
-			CPUModel:   a.CPUModel,
-			CPUCores:   a.CPUCores,
-			RAMTotalMB: a.RAMTotalMB,
-			DiskTotalMB: a.DiskTotalMB,
-			DiskFreeMB: a.DiskFreeMB,
-			Uptime:     a.Uptime,
-			App:        cloneAppStats(a.App),
-			FirstSeen:  a.FirstSeen,
-			LastSeen:   a.LastSeen,
-			Heartbeats: a.Heartbeats,
-			Status:     status,
-		}
+		agents[i] = cloneAgent(s.agents[id], now)
 	}
+	s.mu.RUnlock()
 
 	writeJSON(w, http.StatusOK, agents)
 }
 
 func (s *Server) handleAgentDetail(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	id := r.PathValue("id")
 
 	s.mu.RLock()
@@ -317,42 +376,9 @@ func (s *Server) handleAgentDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status := "online"
-	if time.Since(a.LastSeen) > 5*time.Minute {
-		status = "offline"
-	}
-
-	agentEvents := make([]Event, 0)
-	for _, e := range s.events {
-		if e.InstanceID == id {
-			agentEvents = append(agentEvents, e)
-		}
-	}
+	agent := cloneAgent(a, time.Now())
+	agentEvents := s.recentEventsLocked(maxEventLimit, id)
 	s.mu.RUnlock()
-
-	for i, j := 0, len(agentEvents)-1; i < j; i, j = i+1, j-1 {
-		agentEvents[i], agentEvents[j] = agentEvents[j], agentEvents[i]
-	}
-
-	agent := Agent{
-		InstanceID: a.InstanceID,
-		Hostname:   a.Hostname,
-		GoVersion:  a.GoVersion,
-		OS:         a.OS,
-		Arch:       a.Arch,
-		Kernel:     a.Kernel,
-		CPUModel:   a.CPUModel,
-		CPUCores:   a.CPUCores,
-		RAMTotalMB: a.RAMTotalMB,
-		DiskTotalMB: a.DiskTotalMB,
-		DiskFreeMB: a.DiskFreeMB,
-		Uptime:     a.Uptime,
-		App:        cloneAppStats(a.App),
-		FirstSeen:  a.FirstSeen,
-		LastSeen:   a.LastSeen,
-		Heartbeats: a.Heartbeats,
-		Status:     status,
-	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"agent":  agent,
@@ -361,9 +387,7 @@ func (s *Server) handleAgentDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	stats := ServerStats{
 		Uptime:      time.Since(s.started).Round(time.Second).String(),
@@ -372,38 +396,54 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		TotalErrors: s.errors,
 		StartedAt:   s.started.Format(time.RFC3339),
 	}
+	s.mu.RUnlock()
 
 	writeJSON(w, http.StatusOK, stats)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	result := make([]Event, len(s.events))
-	for i, e := range s.events {
-		result[len(s.events)-1-i] = e
+	limit, err := eventLimit(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
+	s.mu.RLock()
+	result := s.recentEventsLocked(limit, "")
+	s.mu.RUnlock()
 
 	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 	var p Payload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if err := decodeJSONBody(w, r, &p, maxTelemetryBodyBytes); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if err := validatePayload(&p); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
 		return
 	}
 
+	now := time.Now()
+	eventApp := cloneAppStats(p.App)
+	agentApp := cloneAppStats(p.App)
+
 	s.mu.Lock()
+	a, ok := s.agents[p.InstanceID]
+	if !ok && len(s.agents) >= maxAgents {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "agent capacity reached"})
+		return
+	}
+
 	s.total++
 
 	event := Event{
 		InstanceID:  p.InstanceID,
 		Hostname:    p.Hostname,
 		EventType:   p.EventType,
-		Timestamp:   time.Now(),
+		Timestamp:   now,
 		GoVersion:   p.GoVersion,
 		OS:          p.OS,
 		Arch:        p.Arch,
@@ -414,21 +454,18 @@ func (s *Server) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 		DiskTotalMB: p.DiskTotalMB,
 		DiskFreeMB:  p.DiskFreeMB,
 		Uptime:      p.Uptime,
-		App:         cloneAppStats(p.App),
+		App:         eventApp,
 	}
-	if len(s.events) >= maxEvents {
-		s.events = s.events[1:]
-	}
-	s.events = append(s.events, event)
+	s.appendEventLocked(event)
 
-	a, ok := s.agents[p.InstanceID]
 	if !ok {
 		a = &Agent{
 			InstanceID: p.InstanceID,
-			FirstSeen:  time.Now(),
+			FirstSeen:  now,
 		}
 		s.agents[p.InstanceID] = a
 	}
+	previousErrors := eventErrors(a.App)
 	a.Hostname = p.Hostname
 	a.GoVersion = p.GoVersion
 	a.OS = p.OS
@@ -440,15 +477,105 @@ func (s *Server) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 	a.DiskTotalMB = p.DiskTotalMB
 	a.DiskFreeMB = p.DiskFreeMB
 	a.Uptime = p.Uptime
-	a.App = cloneAppStats(p.App)
-	a.LastSeen = time.Now()
+	a.App = agentApp
+	a.LastSeen = now
 	a.Heartbeats++
-	s.errors = s.totalErrorsLocked()
+	a.LastEvent = p.EventType
+	currentErrors := eventErrors(a.App)
+	s.errors = s.errors - previousErrors + currentErrors
 	s.mu.Unlock()
 
 	logLine("telemetry", p.EventType, fmt.Sprintf("agent=%s host=%s errors=%d", trunc(p.InstanceID, 8), ifBlank(p.Hostname, "-"), eventErrors(event.App)))
 
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, limit int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return errBodyTooLarge
+		}
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain one JSON object")
+		}
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return errBodyTooLarge
+		}
+		return errors.New("request body must contain one JSON object")
+	}
+	return nil
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	message := "invalid request body"
+	if errors.Is(err, errBodyTooLarge) {
+		status = http.StatusRequestEntityTooLarge
+		message = errBodyTooLarge.Error()
+	}
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func validatePayload(p *Payload) error {
+	if strings.TrimSpace(p.InstanceID) == "" {
+		return errors.New("instance_id is required")
+	}
+	if len(p.InstanceID) > maxInstanceIDBytes {
+		return fmt.Errorf("instance_id exceeds %d bytes", maxInstanceIDBytes)
+	}
+	if p.EventType != "startup" && p.EventType != "heartbeat" && p.EventType != "shutdown" {
+		return errors.New("event_type must be startup, heartbeat, or shutdown")
+	}
+	for name, value := range map[string]string{
+		"hostname": p.Hostname, "go_version": p.GoVersion, "os": p.OS,
+		"arch": p.Arch, "kernel": p.Kernel, "cpu_model": p.CPUModel, "uptime": p.Uptime,
+	} {
+		if len(value) > maxTelemetryStringBytes {
+			return fmt.Errorf("%s exceeds %d bytes", name, maxTelemetryStringBytes)
+		}
+	}
+	if p.CPUCores < 0 || p.RAMTotalMB < 0 || p.DiskTotalMB < 0 || p.DiskFreeMB < 0 {
+		return errors.New("system metrics cannot be negative")
+	}
+	if p.DiskTotalMB > 0 && p.DiskFreeMB > p.DiskTotalMB {
+		return errors.New("disk_free_mb cannot exceed disk_total_mb")
+	}
+	if p.App == nil {
+		return nil
+	}
+	if p.App.Routes < 0 || p.App.Users < 0 || p.App.AvgLatency < 0 {
+		return errors.New("application metrics cannot be negative")
+	}
+	for name, values := range map[string]map[string]uint64{
+		"status_codes":       p.App.StatusCodes,
+		"block_reasons":      p.App.BlockReasons,
+		"error_status_codes": p.App.ErrorStatusCodes,
+	} {
+		if len(values) > maxMetricMapEntries {
+			return fmt.Errorf("%s exceeds %d entries", name, maxMetricMapEntries)
+		}
+		for key := range values {
+			if len(key) > maxTelemetryStringBytes {
+				return fmt.Errorf("%s contains an oversized key", name)
+			}
+		}
+	}
+	if len(p.App.RecentErrors) > maxRecentErrors {
+		return fmt.Errorf("recent_errors exceeds %d entries", maxRecentErrors)
+	}
+	for _, recent := range p.App.RecentErrors {
+		if len(recent.Kind) > maxTelemetryStringBytes || len(recent.Message) > maxTelemetryStringBytes*2 {
+			return errors.New("recent_errors contains an oversized value")
+		}
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -457,14 +584,53 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func (s *Server) totalErrorsLocked() uint64 {
-	var total uint64
-	for _, a := range s.agents {
-		if a.App != nil {
-			total += a.App.TotalErrors
+func (s *Server) appendEventLocked(event Event) {
+	if s.eventCount < maxEvents {
+		index := (s.eventStart + s.eventCount) % maxEvents
+		s.events[index] = event
+		s.eventCount++
+		return
+	}
+	s.events[s.eventStart] = event
+	s.eventStart = (s.eventStart + 1) % maxEvents
+}
+
+func (s *Server) recentEventsLocked(limit int, instanceID string) []Event {
+	if limit > s.eventCount {
+		limit = s.eventCount
+	}
+	result := make([]Event, 0, limit)
+	for offset := 0; offset < s.eventCount && len(result) < limit; offset++ {
+		index := (s.eventStart + s.eventCount - 1 - offset) % maxEvents
+		event := s.events[index]
+		if instanceID == "" || event.InstanceID == instanceID {
+			result = append(result, event)
 		}
 	}
-	return total
+	return result
+}
+
+func eventLimit(r *http.Request) (int, error) {
+	value := r.URL.Query().Get("limit")
+	if value == "" {
+		return defaultEventLimit, nil
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit < 1 || limit > maxEventLimit {
+		return 0, fmt.Errorf("limit must be between 1 and %d", maxEventLimit)
+	}
+	return limit, nil
+}
+
+func cloneAgent(src *Agent, now time.Time) Agent {
+	status := "online"
+	if src.LastEvent == "shutdown" || now.Sub(src.LastSeen) > 5*time.Minute {
+		status = "offline"
+	}
+	out := *src
+	out.App = cloneAppStats(src.App)
+	out.Status = status
+	return out
 }
 
 func cloneAppStats(src *AppStats) *AppStats {
@@ -574,7 +740,9 @@ func (s *Server) clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.agents = make(map[string]*Agent)
-	s.events = make([]Event, 0, maxEvents)
+	s.events = make([]Event, maxEvents)
+	s.eventStart = 0
+	s.eventCount = 0
 	s.total = 0
 	s.errors = 0
 	logLine("repl", "clear", "telemetry data cleared")
@@ -587,74 +755,126 @@ func trunc(s string, n int) string {
 	return s[:n] + "\u2026"
 }
 
-func main() {
-	port := ":9091"
-	if len(os.Args) > 1 {
-		port = os.Args[1]
-	}
-	if !strings.HasPrefix(port, ":") {
-		port = ":" + port
-	}
-
-	srv := NewServer(port)
-
+func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /api/login", srv.handleLogin)
-	mux.HandleFunc("GET /api/agents", srv.authMiddleware(srv.handleAgents))
-	mux.HandleFunc("GET /api/agents/{id}", srv.authMiddleware(srv.handleAgentDetail))
-	mux.HandleFunc("GET /api/stats", srv.authMiddleware(srv.handleStats))
-	mux.HandleFunc("GET /api/events", srv.authMiddleware(srv.handleEvents))
-	mux.HandleFunc("POST /api/telemetry", srv.handleTelemetry)
-
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	mux.HandleFunc("POST /api/login", s.handleLogin)
+	mux.HandleFunc("GET /api/agents", s.authMiddleware(s.handleAgents))
+	mux.HandleFunc("GET /api/agents/{id}", s.authMiddleware(s.handleAgentDetail))
+	mux.HandleFunc("GET /api/stats", s.authMiddleware(s.handleStats))
+	mux.HandleFunc("GET /api/events", s.authMiddleware(s.handleEvents))
+	mux.HandleFunc("POST /api", s.ingestAuthMiddleware(s.handleTelemetry))
+	mux.HandleFunc("POST /api/telemetry", s.ingestAuthMiddleware(s.handleTelemetry))
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET /static/index.html", serveDashboard)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-
-		if strings.HasPrefix(path, "/api/") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "endpoint not found"})
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "endpoint not found"})
 			return
 		}
-
-		if r.Method == "GET" {
-			http.ServeFile(w, r, "static/index.html")
+		if r.Method == http.MethodGet {
+			serveDashboard(w, r)
 			return
 		}
-
-		if r.Method == "POST" {
-			srv.handleTelemetry(w, r)
+		if r.Method == http.MethodPost && r.URL.Path == "/" {
+			s.ingestAuthMiddleware(s.handleTelemetry)(w, r)
 			return
 		}
-
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	})
+	return securityHeaders(mux)
+}
 
-	server := &http.Server{
-		Addr:              port,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "ok",
+		"uptime_seconds": int64(time.Since(s.started).Seconds()),
+	})
+}
+
+func serveDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(dashboardHTML))
+}
+
+func listenAddress(args []string) (string, error) {
+	address := os.Getenv("TELEMETRY_ADDR")
+	if address == "" {
+		address = "127.0.0.1:9091"
+	}
+	if len(args) > 1 {
+		return "", errors.New("usage: telemetry-server [port|host:port]")
+	}
+	if len(args) == 1 {
+		value := strings.TrimSpace(args[0])
+		if value == "" {
+			return "", errors.New("listen address cannot be empty")
+		}
+		if _, err := strconv.Atoi(value); err == nil {
+			address = net.JoinHostPort("127.0.0.1", value)
+		} else {
+			address = value
+		}
+	}
+	if strings.HasPrefix(address, ":") {
+		address = "0.0.0.0" + address
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("invalid listen address %q: %w", address, err)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("invalid listen port %q", port)
+	}
+	if host == "" {
+		return "", errors.New("listen address must include a host")
+	}
+	return address, nil
+}
+
+func main() {
+	address, err := listenAddress(os.Args[1:])
+	if err != nil {
+		logLine("server", "fatal", err.Error())
+		os.Exit(2)
 	}
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt)
+	srv := NewServer(address)
+
+	server := &http.Server{
+		Addr:              address,
+		Handler:           srv.handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	shutdown := make(chan struct{}, 1)
+	serveErrors := make(chan error, 1)
 
 	go func() {
-		logLine("server", "listening", fmt.Sprintf("addr=%s dashboard=http://localhost%s api=http://localhost%s/api/", port, port, port))
+		logLine("server", "listening", fmt.Sprintf("addr=%s dashboard=http://%s api=http://%s/api/", address, address, address))
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logLine("server", "error", err.Error())
-			os.Exit(1)
+			serveErrors <- err
 		}
 	}()
 
-	go func() {
-		<-stop
-		logLine("server", "shutdown", "shutting down")
-		server.Close()
-		os.Exit(0)
-	}()
+	if usingDefaultAdmin {
+		logLine("auth", "warn", "using default admin password; set TELEMETRY_ADMIN_PASSWORD")
+	}
+	if usingEphemeralJWT {
+		logLine("auth", "warn", "using an ephemeral JWT secret; set TELEMETRY_JWT_SECRET to preserve sessions across restarts")
+	}
+	if len(srv.ingestKey) == 0 {
+		logLine("auth", "warn", "telemetry ingestion is unauthenticated; set TELEMETRY_INGEST_KEY")
+	}
 
 	go func() {
 		logLine("repl", "start", "type help for commands")
@@ -678,13 +898,29 @@ func main() {
 				srv.clear()
 			case cmd == "exit" || cmd == "quit":
 				logLine("repl", "shutdown", "bye")
-				server.Close()
-				os.Exit(0)
+				select {
+				case shutdown <- struct{}{}:
+				default:
+				}
+				return
 			default:
 				logLine("repl", "warn", fmt.Sprintf("unknown command=%s", cmd))
 			}
 		}
 	}()
 
-	select {}
+	select {
+	case <-ctx.Done():
+		logLine("server", "shutdown", "signal received")
+	case <-shutdown:
+	case err := <-serveErrors:
+		logLine("server", "error", err.Error())
+		return
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logLine("server", "error", fmt.Sprintf("graceful shutdown: %v", err))
+	}
 }
