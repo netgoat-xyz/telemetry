@@ -44,13 +44,15 @@ const state = {
   selected: null,
   detail: null,
   filters: {
-    status: localStorage.getItem('errors_status') || 'open',
+    status: ['open', 'resolved', 'all'].includes(localStorage.getItem('errors_status')) ? localStorage.getItem('errors_status') : 'open',
     level: 'all',
     environment: 'all',
     service: 'all',
     q: '',
   },
 };
+let loadGeneration = 0;
+let refreshTimer = null;
 
 const $ = (sel, ctx = document) => ctx.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -102,20 +104,26 @@ function qs() {
 }
 
 async function load() {
+  const generation = ++loadGeneration;
   const [stats, issues] = await Promise.all([
     api('/api/stats'),
     api('/api/issues?' + qs()),
   ]);
+  if (generation !== loadGeneration) return;
   state.stats = stats;
   state.issues = issues;
-  if (!state.selected && issues[0]) state.selected = issues[0].id;
-  if (state.selected) await loadDetail(state.selected, false);
+  if (!issues.some((issue) => issue.id === state.selected)) state.selected = issues[0]?.id || null;
+  if (state.selected) await loadDetail(state.selected, false, generation);
+  else state.detail = null;
+  if (generation !== loadGeneration) return;
   render();
 }
 
-async function loadDetail(id, rerender = true) {
+async function loadDetail(id, rerender = true, generation = loadGeneration) {
   state.selected = id;
-  state.detail = await api('/api/issues/' + encodeURIComponent(id));
+  const detail = await api('/api/issues/' + encodeURIComponent(id));
+  if (generation !== loadGeneration || state.selected !== id) return;
+  state.detail = detail;
   if (rerender) render();
 }
 
@@ -336,6 +344,8 @@ function renderEvents(events) {
 
 function render() {
   const s = state.stats || {};
+  const restoreQueryFocus = document.activeElement?.id === 'query';
+  const querySelection = restoreQueryFocus ? document.activeElement.selectionStart : null;
   $('#app').innerHTML = `
     <div class="flex h-screen flex-col overflow-hidden">
       <header class="border-b border-zinc-200 bg-white px-4 sm:px-6 py-4">
@@ -362,7 +372,6 @@ function render() {
     </div>
   `;
 
-  $('.issue-row', document)?.focus?.();
   document.querySelectorAll('.issue-row').forEach((row) => {
     row.addEventListener('click', () => loadDetail(row.dataset.id));
   });
@@ -381,6 +390,11 @@ function render() {
   }, 250));
   $('#refresh').addEventListener('click', load);
   $('#toggle-status')?.addEventListener('click', () => setStatus(state.detail.issue.id, state.detail.issue.status === 'resolved' ? 'open' : 'resolved'));
+  if (restoreQueryFocus) {
+    const query = $('#query');
+    query.focus();
+    query.setSelectionRange(querySelection, querySelection);
+  }
 }
 
 function debounce(fn, ms) {
@@ -391,10 +405,28 @@ function debounce(fn, ms) {
   };
 }
 
-load().catch((err) => {
+async function refresh() {
+  clearTimeout(refreshTimer);
+  if (document.hidden) return;
+  try {
+    await load();
+  } catch (err) {
+    if (!state.stats) {
+      $('#app').innerHTML = `<div class="flex min-h-screen items-center justify-center p-6"><div class="rounded-xl border border-red-200 bg-red-50 p-6 text-sm text-red-700">${esc(err.message)}</div></div>`;
+    }
+  } finally {
+    if (!document.hidden) refreshTimer = setTimeout(refresh, 5000);
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) clearTimeout(refreshTimer);
+  else refresh();
+});
+
+refresh().catch((err) => {
   $('#app').innerHTML = `<div class="flex min-h-screen items-center justify-center p-6"><div class="rounded-xl border border-red-200 bg-red-50 p-6 text-sm text-red-700">${esc(err.message)}</div></div>`;
 });
-setInterval(() => load().catch(() => {}), 5000);
 </script>
 </body>
 </html>
