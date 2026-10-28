@@ -1,0 +1,10 @@
+# Normalise text files to LF in the repository so Linux containers and
+# contributors on any platform see the same bytes.
+* text=auto eol=lf
+
+# Binary assets are never converted.
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.exe binary
