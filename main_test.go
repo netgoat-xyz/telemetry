@@ -272,7 +272,7 @@ func TestDashboardIsEmbeddedAndHealthIsPublic(t *testing.T) {
 		t.Fatalf("dashboard status=%d body=%q", dashboard.Code, dashboard.Body.String())
 	}
 	health := request(handler, http.MethodGet, "/health", nil, nil)
-	if health.Code != http.StatusOK || !strings.Contains(health.Body.String(), `"status":"ok"`) {
+	if health.Code != http.StatusOK || !strings.Contains(health.Body.String(), `"status":"ok"`) || !strings.Contains(health.Body.String(), `"cas_enabled":false`) {
 		t.Fatalf("health status=%d body=%q", health.Code, health.Body.String())
 	}
 }

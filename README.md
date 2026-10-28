@@ -16,6 +16,10 @@ go run .
 
 The server listens on `127.0.0.1:9091` by default. Open <http://127.0.0.1:9091> and sign in with the configured administrator credentials. If no credentials are configured, the local-development fallback is `admin` / `admin` and the server logs a warning.
 
+CAS is optional here too. Leave `CAS_ENABLED` (or `TELEMETRY_CAS_ENABLED`) unset
+to run the dashboard as a standalone telemetry viewer; set it to `true` when
+the dashboard should advertise a central administrative service integration.
+
 A positional port continues to work and stays loopback-only:
 
 ```bash
@@ -55,6 +59,7 @@ Leaving `TELEMETRY_INGEST_KEY` unset preserves compatibility with unconfigured l
 | `TELEMETRY_ADMIN_PASSWORD` | `admin` | Dashboard password; always override outside local development |
 | `TELEMETRY_JWT_SECRET` | random per process | HMAC key for 24-hour dashboard sessions; set it to preserve sessions across restarts |
 | `TELEMETRY_INGEST_KEY` | empty | Optional shared key required in `X-Telemetry-Key` for ingestion |
+| `CAS_ENABLED` / `TELEMETRY_CAS_ENABLED` | `false` | Marks the dashboard as CAS-aware and surfaces the standalone/connected state in the UI |
 | `NO_COLOR` | empty | Disable ANSI colors in logs when set |
 
 ## HTTP API

@@ -31,6 +31,7 @@ var adminUsers = map[string]string{}
 var configuredIngestKey []byte
 var usingDefaultAdmin bool
 var usingEphemeralJWT bool
+var casEnabled bool
 
 const jwtHeader = `{"alg":"HS256","typ":"JWT"}`
 
@@ -38,6 +39,8 @@ const jwtHeader = `{"alg":"HS256","typ":"JWT"}`
 var dashboardHTML []byte
 
 func init() {
+	casEnabled = strings.EqualFold(os.Getenv("CAS_ENABLED"), "true") || strings.EqualFold(os.Getenv("TELEMETRY_CAS_ENABLED"), "true")
+
 	secret := os.Getenv("TELEMETRY_JWT_SECRET")
 	if secret == "" {
 		generated := make([]byte, 32)
@@ -232,6 +235,20 @@ type Server struct {
 	started    time.Time
 	address    string
 	ingestKey  []byte
+	logins     *loginThrottle
+}
+
+// loginThrottle rate-limits admin sign-in attempts per source address so the
+// password cannot be brute-forced over the network.
+type loginThrottle struct {
+	mu       sync.Mutex
+	attempts map[string]*loginAttempt
+}
+
+type loginAttempt struct {
+	failures    int
+	lockedUntil time.Time
+	lastSeen    time.Time
 }
 
 const (
@@ -267,7 +284,78 @@ func NewServer(address string) *Server {
 		started:   time.Now(),
 		address:   address,
 		ingestKey: append([]byte(nil), configuredIngestKey...),
+		logins:    &loginThrottle{attempts: make(map[string]*loginAttempt)},
 	}
+}
+
+const (
+	maxLoginFailures   = 5
+	loginLockoutWindow = 15 * time.Minute
+	loginAttemptTTL    = time.Hour
+	maxTrackedLoginIPs = 4096
+)
+
+// allow reports whether key may attempt a login now.
+func (t *loginThrottle) allow(key string) (bool, time.Duration) {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pruneLocked(now)
+
+	entry := t.attempts[key]
+	if entry == nil {
+		return true, 0
+	}
+	if now.Before(entry.lockedUntil) {
+		return false, time.Until(entry.lockedUntil)
+	}
+	return true, 0
+}
+
+func (t *loginThrottle) recordFailure(key string) {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pruneLocked(now)
+
+	entry := t.attempts[key]
+	if entry == nil {
+		if len(t.attempts) >= maxTrackedLoginIPs {
+			return
+		}
+		entry = &loginAttempt{}
+		t.attempts[key] = entry
+	}
+	entry.failures++
+	entry.lastSeen = now
+	if entry.failures >= maxLoginFailures {
+		entry.lockedUntil = now.Add(loginLockoutWindow)
+		entry.failures = 0
+	}
+}
+
+func (t *loginThrottle) recordSuccess(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.attempts, key)
+}
+
+func (t *loginThrottle) pruneLocked(now time.Time) {
+	for key, entry := range t.attempts {
+		if now.After(entry.lockedUntil) && now.Sub(entry.lastSeen) > loginAttemptTTL {
+			delete(t.attempts, key)
+		}
+	}
+}
+
+// loginKey identifies the peer for throttling. RemoteAddr is used rather than
+// any forwarded header because those are attacker-controlled.
+func loginKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -288,7 +376,13 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) ingestAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if len(s.ingestKey) > 0 && !constantTimeEqual(r.Header.Get("X-Telemetry-Key"), string(s.ingestKey)) {
+		// Fail closed: with no key configured, ingestion previously accepted
+		// spoofed telemetry from anyone who could reach the port.
+		if len(s.ingestKey) == 0 {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry ingestion is not configured"})
+			return
+		}
+		if !constantTimeEqual(r.Header.Get("X-Telemetry-Key"), string(s.ingestKey)) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid telemetry key"})
 			return
 		}
@@ -315,6 +409,13 @@ func constantTimeEqual(left, right string) bool {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	peer := loginKey(r)
+	if allowed, retryAfter := s.logins.allow(peer); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed sign-in attempts"})
+		return
+	}
+
 	var creds struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -330,9 +431,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	validPassword := constantTimeEqual(creds.Password, expectedPass)
 	if !ok || !validPassword {
+		s.logins.recordFailure(peer)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 		return
 	}
+	s.logins.recordSuccess(peer)
 
 	token, err := createToken(creds.Username)
 	if err != nil {
@@ -791,12 +894,27 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":         "ok",
 		"uptime_seconds": int64(time.Since(s.started).Seconds()),
+		"cas_enabled":    casEnabled,
 	})
 }
 
 func serveDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(dashboardHTML))
+	body := bytes.ReplaceAll(dashboardHTML, []byte("__NETGOAT_CAS_ENABLED__"), []byte(strconv.FormatBool(casEnabled)))
+	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(body))
+}
+
+// isLoopbackListen reports whether the listen address only accepts local traffic.
+func isLoopbackListen(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func listenAddress(args []string) (string, error) {
@@ -843,6 +961,22 @@ func main() {
 	}
 
 	srv := NewServer(address)
+
+	// Default credentials are tolerable on loopback for local development, but
+	// must never be reachable from the network.
+	if !isLoopbackListen(address) && !strings.EqualFold(os.Getenv("TELEMETRY_ALLOW_INSECURE"), "true") {
+		var insecure []string
+		if usingDefaultAdmin {
+			insecure = append(insecure, "TELEMETRY_ADMIN_PASSWORD is unset (default admin password)")
+		}
+		if len(srv.ingestKey) == 0 {
+			insecure = append(insecure, "TELEMETRY_INGEST_KEY is unset")
+		}
+		if len(insecure) > 0 {
+			logLine("auth", "fatal", fmt.Sprintf("refusing to listen on non-loopback %s: %s", address, strings.Join(insecure, "; ")))
+			os.Exit(2)
+		}
+	}
 
 	server := &http.Server{
 		Addr:              address,
