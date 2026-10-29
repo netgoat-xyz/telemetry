@@ -145,6 +145,12 @@ distroless static as `nonroot` with a bundled busybox for the `/health`
 healthcheck. The error monitor has its own Dockerfile under `software-errors/`
 and is documented in [its README](software-errors/README.md).
 
+> **Exposure warning.** `ERROR_MONITOR_INGEST_KEY` authenticates the ingest
+> endpoint only. The dashboard, issue list and issue updates are served
+> without authentication. Publishing port 9092 on a public interface exposes
+> them to anyone who can reach the host. Bind it to a private network, or put
+> an authenticating proxy in front of it.
+
 ## Deployment
 
 Both services are stateless and safe to restart. Terminate TLS at a reverse

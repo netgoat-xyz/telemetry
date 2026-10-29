@@ -21,5 +21,5 @@ USER nonroot:nonroot
 EXPOSE 9091
 ENV TELEMETRY_ADDR=0.0.0.0:9091 \
     GOMEMLIMIT=128MiB
-HEALTHCHECK --interval=10s --timeout=3s --retries=8 --start-period=5s CMD ["/busybox", "wget", "-qO-", "http://127.0.0.1:9091/health"]
+HEALTHCHECK --interval=10s --timeout=3s --retries=8 --start-period=5s CMD ["/busybox", "sh", "-c", "/busybox wget -qO- \"http://127.0.0.1:${TELEMETRY_ADDR##*:}/health\""]
 ENTRYPOINT ["/app/telemetry-server"]
